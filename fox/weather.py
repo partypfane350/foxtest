@@ -6,19 +6,13 @@ API_KEY = os.getenv("OPENWEATHER_KEY", "2b118b7ee7e7b7812a41049225055d22")
 BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 
 def _clean(text: str) -> str:
-    # trim + doppelte Spaces entfernen
     return " ".join((text or "").strip().split())
 
 def get_weather(city: str) -> str:
-    """
-    Robust gegen Kleinschreibung, Extra-Spaces und Tipp-Schwankungen.
-    Versucht mehrere Varianten, bis OpenWeather was findet.
-    """
     city = _clean(city)
     if not city:
         return "Kein Ort angegeben."
 
-    # Kandidaten testen: original, Title-Case (z.B. 'new york' -> 'New York')
     candidates = []
     seen = set()
     for cand in (city, city.title()):
@@ -42,11 +36,9 @@ def get_weather(city: str) -> str:
                     return f"Wetterdaten für {name} unvollständig."
                 return f"Wetter in {name}: {temp:.1f}°C, {desc}"
             elif r.status_code == 404:
-                # Nicht gefunden → nächsten Kandidaten versuchen
                 last_err = f"Wetter für '{cand}' nicht gefunden."
                 continue
             else:
-                # Andere API-Fehler direkt anzeigen
                 try:
                     msg = r.json().get("message", "")
                 except Exception:
@@ -54,5 +46,4 @@ def get_weather(city: str) -> str:
                 return f"Wetter-Fehler {r.status_code}: {msg or 'unbekannt'}"
         except Exception as e:
             last_err = f"Fehler beim Wetterabruf: {e}"
-
     return last_err or f"Wetter für '{city}' nicht gefunden."

@@ -9,9 +9,8 @@ from sklearn.linear_model import SGDClassifier
 
 # === Skills ===
 from fox.weather import get_weather
-from fox.geo import geo_skill
+from fox.geo import geo_skill, resolve_place, ensure_geo_db
 from fox.calc import try_auto_calc
-
 
 # ========= Pfade =========
 MODEL_PATH      = Path("fox_intent.pkl")
@@ -19,26 +18,27 @@ FACTS_PATH      = "facts.json"
 TRAIN_PATH      = "train_data.json"
 CALENDAR_PATH   = "calendar.json"
 
-# Alle möglichen Intents (Labels)
+# ========= Labels =========
+# Keep only what we actually route. Old labels get normalized (see normalize_label).
 CLASSES = [
-    # ---- Gespräche ---- 
-    "smalltalk",         
-    
-    # ---- Wissen ----
-        # School      
-        "geo",
-        "rechner"
-    ,
-        # Allgemein
-        "wetter"
-        "wissen",
-        "zeitfrage",
-        
-    # ---- Bank ----
-
-    # ---- Machen ----
-    "termin"        
+    "smalltalk",
+    "geo",
+    "rechner",
+    "wetter",
+    "wissen",
+    "zeitfrage",
+    "termin",
 ]
+
+def normalize_label(lbl: str) -> str:
+    # Map legacy labels to current ones so routing stays stable with old training data
+    mapping = {
+        "termine": "termin",
+        "stadtfrage": "geo",
+        "kontinentfrage": "geo",
+        "mathfrage": "rechner",
+    }
+    return mapping.get(lbl, lbl)
 
 # ========= JSON-Utils =========
 def load_json(path, default):
@@ -53,36 +53,29 @@ def save_json(path, data):
 
 # ========= Start-Trainingsdaten =========
 train_texts = [
-    
     # Smalltalk
     "Wie geht es dir?", "Erzähl mir einen Witz", "Hallo Fox", "Was kannst du alles?",
-
     # Mathefragen
     "Was ist 2 + 2?", "Was ist 3 * 5?", "Was ist 10 - 4?", "Was ist 8 / 2?",
-
     # Stadtfragen
     "Welche Städte gibt es in Deutschland?", "Welche Städte hat Deutschland?",
     "Liste alle Städte in Japan", "Welche Städte gibt es in Italien?",
-
     # Kontinente
     "Welche Kontinente gibt es?", "Nenne mir alle Kontinente",
     "Was sind die Kontinente der Erde?", "Welche Kontinente kennst du?",
-
     # Zeitfragen    
     "Wie spät ist es?", "Wie viel Uhr haben wir?", "Sag mir die Uhrzeit", "Was ist die aktuelle Uhrzeit?",
-
     # Wetterfragen
     "Wie ist das Wetter heute?", "Wie wird das Wetter morgen?",
     "Wird es heute regnen?", "Wie ist die Wettervorhersage für diese Woche?",
-
     # Wissen
     "wer ist der erste Mensch auf dem Mond?", "Wer hat die Relativitätstheorie entwickelt?",
     "Was ist die größte Stadt der Welt?", "Was ist die kleinste Stadt der Welt?",
-
     # Termine
     "Wann ist Weihnachten?", "Wann ist Silvester?", "Wann ist der nächste Feiertag?", "Wann ist dein Geburtstag?"
 ]
 
+# Keep training labels as-is; we'll normalize at inference time
 train_labels = [
     "smalltalk","smalltalk","smalltalk","smalltalk",
     "mathfrage","mathfrage","mathfrage","mathfrage",
@@ -131,6 +124,7 @@ def refit_after_learn():
 
 # ========= Slots =========
 WEEKDAYS = ["montag","dienstag","mittwoch","donnerstag","freitag","samstag","sonntag"]
+
 def extract_datetime(text: str):
     t = text.lower()
     when = None
@@ -139,12 +133,12 @@ def extract_datetime(text: str):
     else:
         for wd in WEEKDAYS:
             if wd in t: when = wd; break
-
     m = re.search(r"(\d{1,2})[:.](\d{2})", t)
     clock = f"{int(m.group(1)):02d}:{int(m.group(2)):02d}" if m else None
     return {"when": when, "time": clock}
 
 # ========= Speicher-Funktionen =========
+
 def add_fact(key: str, value: str):
     facts = load_json(FACTS_PATH, {})
     facts[key] = value
@@ -164,6 +158,7 @@ def add_event_free(text: str):
     return evts[-1]
 
 # ========= Skills =========
+
 def smalltalk_skill(text, ctx):
     if "witz" in text.lower():
         return "Treffen sich zwei Bytes. Sagt das eine: 'WLAN hier?' — 'Nee, nur LAN.'"
@@ -177,10 +172,16 @@ def calc_skill(text, ctx):
     return f"Ergebnis: {res}" if res is not None else "Sag mir einen Ausdruck, z. B. 12*7."
 
 def weather_skill(text, ctx):
-    loc = geo_skill(text, ctx)
-    if not loc: 
-        return "Sag mir einen Ort für Wetter (z. B. in Bern)."
-    return get_weather(loc)
+    # Prefer slot-resolved place
+    slots = ctx.get("slots") or {}
+    place = slots.get("where")
+    if not place:
+        place = resolve_place(text, ctx)
+    if not place:
+        return "Sag mir eine Stadt für Wetter (z. B. 'in Bern')."
+    if place.get("type") == "country" or not place.get("lat") or not place.get("lon"):
+        return f"'{place.get('name','das Land')}' ist zu groß. Nenn mir eine Stadt darin (z. B. 'Bern')."
+    return get_weather(place["name"])  # If your API supports coords, pass lat/lon here.
 
 def geo_skill_main(text, ctx):
     return geo_skill(text, ctx)
@@ -199,44 +200,37 @@ def fallback_skill(text, ctx):
     return "Das weiß ich noch nicht. Erklär mir kurz, was du brauchst – dann lerne ich es."
 
 # ========= Routing =========
+
 def route(label, text, ctx):
-    
-    # ---- Gespräch ----
+    # Normalize legacy labels to current
+    label = normalize_label(label)
+
+    # --- Smalltalk & Zeit ---
     if label == "smalltalk":
         return smalltalk_skill(text, ctx)
-  
-
-    # ---- Wissen ----
-        
-        # School
-    if label == "geo":
-        return geo_skill_main(text, ctx)
-   
-    if label == "rechner":
-        return calc_skill(text, ctx)
-
-        # Allgemein 
-    if label == "wetter":
-        return weather_skill(text, ctx)
-   
-    if label == "wissen":
-        return wiki_skill(text, ctx)
-    
     if label == "zeitfrage":
         return time_skill(text, ctx)
 
+    # --- Wissen & Geo ---
+    if label == "geo":
+        return geo_skill_main(text, ctx)
+    if label == "wissen":
+        return wiki_skill(text, ctx)
 
-    # ---- Bank ----
+    # --- Wetter ---
+    if label == "wetter":
+        return weather_skill(text, ctx)
 
+    # --- Rechnen ---
+    if label == "rechner":
+        return calc_skill(text, ctx)
 
-    # ---- Machen ----
+    # --- Termine ---
     if label == "termin":
         return calendar_skill(text, ctx)
 
-
-    # ---- Fallback ----
+    # --- Fallback ---
     return fallback_skill(text, ctx)
-
 
 # ========= Orchestrator =========
 memory = deque(maxlen=200)
@@ -251,12 +245,17 @@ def handle(user: str) -> str:
     X = vectorizer.transform([user])
     proba = clf.predict_proba(X)[0]
     idx = int(proba.argmax())
-    label = clf.classes_[idx]
+    raw_label = clf.classes_[idx]
+    label = normalize_label(raw_label)
     conf = float(proba[idx])
 
+    # Slots
     slots = extract_datetime(user)
-    slots["where"] = geo_skill(user, {"slots": slots, "memory": list(memory)})
+    # Resolve place via DB and store the FULL dict for richer downstream usage
+    place = resolve_place(user, {"slots": slots, "memory": list(memory)})
+    slots["where"] = place if place else None
 
+    # Guardrails
     if label == "wetter" and not slots["where"]:
         return "Für Wetter brauche ich noch einen Ort (z. B. 'in Bern')."
     if label == "termin" and not (slots["when"] or slots["time"]):
@@ -272,6 +271,7 @@ def handle(user: str) -> str:
     return reply
 
 # ========= CLI =========
+
 def main():
     print("🦊 Fox Assistant – mit Speicher")
     print("Befehle:")
@@ -279,6 +279,9 @@ def main():
     print("  fact: <key> = <val>")
     print("  termin: <beschreibung>")
     print("  save | reload | showmem | showfacts | showtrain | showcal | quit\n")
+
+    # Ensure geo DB exists (won't override existing)
+    ensure_geo_db(seed_minimal=True)
 
     hist = build_or_load()
     print(f"[i] Modell geladen – Beispiele: {hist['n_samples']}")
@@ -290,43 +293,28 @@ def main():
         if not user: continue
         l = user.lower()
 
-        if l in ("quit","exit"): 
-            print("Bis bald!"); 
-            break
-        
+        if l in ("quit","exit"):
+            print("Bis bald!"); break
         if l == "save":
             joblib.dump((clf, vectorizer, {"n_samples": len(train_texts)}), MODEL_PATH)
             print(f"Fox: Modell gespeichert → {MODEL_PATH}")
             print("Fox: Trainingsdaten sind bereits fix in train_data.json gespeichert ✅")
             continue
-        
-        if l == "reload": 
-            build_or_load(); 
-            print("Fox: Modell neu geladen."); 
-            continue
-        
-        if l == "showmem": 
-            print(json.dumps(list(memory), ensure_ascii=False, indent=2)); 
-            continue
-        
-        if l == "showfacts": 
-            print(json.dumps(load_json(FACTS_PATH, {}), ensure_ascii=False, indent=2)); 
-            continue
-        
-        if l == "showtrain": 
-            print(json.dumps(load_json(TRAIN_PATH, {"texts": [], "labels": []}), ensure_ascii=False, indent=2)); 
-            continue
-        
-        if l == "showcal": 
-            print(json.dumps(load_json(CALENDAR_PATH, []), ensure_ascii=False, indent=2)); 
-            continue
+        if l == "reload":
+            build_or_load(); print("Fox: Modell neu geladen."); continue
+        if l == "showmem":
+            print(json.dumps(list(memory), ensure_ascii=False, indent=2)); continue
+        if l == "showfacts":
+            print(json.dumps(load_json(FACTS_PATH, {}), ensure_ascii=False, indent=2)); continue
+        if l == "showtrain":
+            print(json.dumps(load_json(TRAIN_PATH, {"texts": [], "labels": []}), ensure_ascii=False, indent=2)); continue
+        if l == "showcal":
+            print(json.dumps(load_json(CALENDAR_PATH, []), ensure_ascii=False, indent=2)); continue
 
         if l.startswith("learn:"):
             try:
                 payload = user.split("learn:", 1)[1].strip()
                 q, lab = [p.strip() for p in payload.split("=>", 1)]
-                if lab not in CLASSES:
-                    print("Fox: Unbekanntes Label. Erlaubt:", ", ".join(CLASSES)); continue
                 add_training(q, lab)
                 train_texts.append(q); train_labels.append(lab)
                 hist = refit_after_learn()
