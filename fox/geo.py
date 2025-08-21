@@ -1,312 +1,223 @@
 from __future__ import annotations
 import sqlite3
-import re
-import unicodedata
+from pathlib import Path
 from contextlib import closing
 from typing import Optional, Dict, Any, List, Tuple
-from pathlib import Path
+import re
 
-# === Config ===
+# === Pfad zur produktiven DB (anpassen falls nötig) ===
+# Erwartetes Schema:
+#   places(name TEXT, country_code TEXT, population INTEGER, latitude REAL, longitude REAL,
+#          feature_class TEXT, feature_code TEXT, ...)
+#   iso2(code TEXT PRIMARY KEY, name TEXT)
 DB_PATH = (Path(__file__).resolve().parents[1] / "geo_data" / "geo.db").as_posix()
 
-# Optional ISO2 fallback (used only if iso2 table missing)
-ISO2 = {
-    "DE": "Deutschland","FR":"Frankreich","CH":"Schweiz","IT":"Italien","ES":"Spanien",
-    "AT":"Österreich","US":"USA","GB":"Vereinigtes Königreich","JP":"Japan","CN":"China",
-    "IN":"Indien","BR":"Brasilien","CA":"Kanada","AU":"Australien"
+# Schnell-Mapping ISO2 -> Ländername (Fallback, wenn iso2-Tabelle fehlt/leer ist)
+ISO2_FALLBACK = {
+    "DE": "Germany", "FR": "France", "CH": "Switzerland", "IT": "Italy", "ES": "Spain",
+    "AT": "Austria", "US": "United States", "GB": "United Kingdom", "JP": "Japan",
+    "CN": "China", "IN": "India", "BR": "Brazil", "CA": "Canada", "AU": "Australia",
 }
 
-# === Regex for free-text place hints ===
-_LOC_PAT = re.compile(r"\b(?:in|über|zu|nach|für)\s+([A-Za-zÄÖÜäöüß\-’']+)\b", re.IGNORECASE)
-_WHERE_IS_PAT = re.compile(r"\b(?:wo\s+ist|where\s+is)\s+([A-Za-zÄÖÜäöüß\-’']+)\b", re.IGNORECASE)
+# Ein paar Deutsch/Englisch-Synonyme (erweiterbar). Nur für Länder-Namen.
+COUNTRY_SYNONYMS = {
+    "schweiz": ["switzerland", "ch"],
+    "spanien": ["spain", "es"],
+    "deutschland": ["germany", "de"],
+    "österreich": ["austria", "at"],
+    "frankreich": ["france", "fr"],
+    "italien": ["italy", "it"],
+    "vereinigtes königreich": ["united kingdom", "uk", "gb"],
+    "großbritannien": ["united kingdom", "uk", "gb"],
+    "usa": ["united states", "us", "usa"],
+}
 
-# ---------- Utilities ----------
-def _normalize(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s).casefold()
-    return "".join(c for c in s if not unicodedata.combining(c))
-
-def _tokenize(text: str) -> List[str]:
-    return re.findall(r"[A-Za-zÄÖÜäöüß\-’']+", text)
-
-# ---------- DB helpers ----------
-class _Schema:
-    table: str
-    name_col: str
-    country_code_col: Optional[str]
-    country_name_col: Optional[str]
-    population_col: Optional[str]
-    lat_col: Optional[str]
-    lon_col: Optional[str]
-    iso_table: Optional[str]
-    iso_code_col: Optional[str]
-    iso_name_col: Optional[str]
-
-    def __init__(self):
-        self.table = "places"
-        self.name_col = "name"
-        self.country_code_col = "country_code"
-        self.country_name_col = None
-        self.population_col = "population"
-        self.lat_col = "lat"
-        self.lon_col = "lon"
-        self.iso_table = "iso2"
-        self.iso_code_col = "code"
-        self.iso_name_col = "name"
-
+# --------- interne Helfer ---------
 def _open():
-    return sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA temp_store=MEMORY;")
+    return con
 
-def _table_columns(cur, table: str) -> List[str]:
-    cur.execute(f"PRAGMA table_info({table})")
-    return [row[1] for row in cur.fetchall()]
-
-# Create minimal schema if DB is empty (no crash on first run)
-def ensure_geo_db(seed_minimal: bool = True) -> None:
-    with closing(_open()) as conn, closing(conn.cursor()) as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS places (
-              id INTEGER PRIMARY KEY,
-              name TEXT NOT NULL,
-              country_code TEXT,
-              country TEXT,
-              population INTEGER,
-              lat REAL,
-              lon REAL
-            );
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_places_name ON places(name);")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS iso2 (
-              code TEXT PRIMARY KEY,
-              name TEXT NOT NULL
-            );
-            """
-        )
-        if seed_minimal:
-            cur.execute("SELECT COUNT(*) FROM places;")
-            if (cur.fetchone() or [0])[0] == 0:
-                cur.executemany(
-                    "INSERT INTO places (name, country_code, country, population, lat, lon) VALUES (?,?,?,?,?,?)",
-                    [
-                        ("Bern","CH","Schweiz",133883,46.94809,7.44744),
-                        ("Zürich","CH","Schweiz",402762,47.37689,8.54169),
-                        ("Basel","CH","Schweiz",178247,47.55960,7.58858),
-                        ("Berlin","DE","Deutschland",3769495,52.52001,13.40495),
-                    ]
-                )
-            cur.execute("SELECT COUNT(*) FROM iso2;")
-            if (cur.fetchone() or [0])[0] == 0:
-                cur.executemany(
-                    "INSERT INTO iso2 (code, name) VALUES (?,?)",
-                    [(k,v) for k,v in ISO2.items()]
-                )
-        conn.commit()
-
-# Flexible schema detection (places/cities)
-def _detect_schema(cur) -> _Schema:
-    s = _Schema()
-    found_table = None
-    for t in ("places", "cities"):
-        try:
-            cols = _table_columns(cur, t)
-            if cols:
-                found_table = t; break
-        except sqlite3.Error:
-            pass
-    if not found_table:
-        # Initialize minimal schema and use places
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS places (
-              id INTEGER PRIMARY KEY,
-              name TEXT NOT NULL,
-              country_code TEXT,
-              country TEXT,
-              population INTEGER,
-              lat REAL,
-              lon REAL
-            );
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_places_name ON places(name);")
-        found_table = "places"
-
-    s.table = found_table
-    cols = set(_table_columns(cur, found_table))
-
-    s.name_col = "name" if "name" in cols else ("city" if "city" in cols else "name")
-    s.country_code_col = "country_code" if "country_code" in cols else ("iso2" if "iso2" in cols else None)
-    s.country_name_col = "country" if "country" in cols else None
-
-    s.population_col = None
-    for cand in ("population","pop","inhabitants"):
-        if cand in cols:
-            s.population_col = cand; break
-
-    s.lat_col = "lat" if "lat" in cols else ("latitude" if "latitude" in cols else None)
-    s.lon_col = "lon" if "lon" in cols else ("longitude" if "longitude" in cols else None)
-
-    try:
-        iso_cols = set(_table_columns(cur, "iso2"))
-        if iso_cols:
-            s.iso_table = "iso2"
-            s.iso_code_col = "code" if "code" in iso_cols else None
-            s.iso_name_col = "name" if "name" in iso_cols else None
-        else:
-            s.iso_table = None
-    except sqlite3.Error:
-        s.iso_table = None
-
-    return s
-
-# Country name resolver (code → name)
-def _country_name_from_code(cur, code: Optional[str], schema: _Schema) -> Optional[str]:
+def _country_name_from_code(cur: sqlite3.Cursor, code: Optional[str]) -> Optional[str]:
     if not code:
         return None
-    if not schema.iso_table or not schema.iso_code_col or not schema.iso_name_col:
-        return ISO2.get(code)
     try:
-        cur.execute(
-            f"SELECT {schema.iso_name_col} FROM {schema.iso_table} WHERE {schema.iso_code_col} = ?",
-            (code,)
-        )
+        cur.execute("SELECT name FROM iso2 WHERE code = ? COLLATE NOCASE", (code,))
         row = cur.fetchone()
-        return row[0] if row else ISO2.get(code)
-    except sqlite3.Error:
-        return ISO2.get(code)
+        return row[0] if row else ISO2_FALLBACK.get(code.upper())
+    except Exception:
+        return ISO2_FALLBACK.get(code.upper())
 
-# Row → dict
+def _normalize(s: str) -> str:
+    return (s or "").strip().lower()
 
-def _row_to_place_dict(row: Tuple, cols: List[str], schema: _Schema, cur) -> Dict[str, Any]:
-    data = dict(zip(cols, row))
-    name = data.get(schema.name_col)
-    country_name = data.get(schema.country_name_col)
-    if not country_name and schema.country_code_col and data.get(schema.country_code_col):
-        country_name = _country_name_from_code(cur, data.get(schema.country_code_col), schema)
-
-    return {
-        "type": "place",
-        "name": name,
-        "country": country_name or data.get(schema.country_code_col),
-        "population": data.get(schema.population_col) if schema.population_col else None,
-        "lat": data.get(schema.lat_col) if schema.lat_col else None,
-        "lon": data.get(schema.lon_col) if schema.lon_col else None,
-    }
-
-# Public search APIs
-
+# --------- Öffentliche Kernfunktionen ---------
 def search_places(query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    if not query:
+    """
+    Liefert Orte (Städte/Verwaltungseinheiten) aus 'places' – case-insensitive.
+    Lädt nur die Top-N per SQL. Erwartet Index auf 'name' für Performance.
+    """
+    q = (query or "").strip()
+    if not q:
         return []
-    like = f"%{query}%"
-    with closing(_open()) as conn, closing(conn.cursor()) as cur:
-        schema = _detect_schema(cur)
-        cols = _table_columns(cur, schema.table)
-        select_cols = ", ".join(cols)
-        # Order by population if available
-        if schema.population_col:
-            cur.execute(
-                f"SELECT {select_cols} FROM {schema.table} WHERE {schema.name_col} LIKE ? ORDER BY {schema.population_col} DESC",
-                (like,)
-            )
-        else:
-            cur.execute(
-                f"SELECT {select_cols} FROM {schema.table} WHERE {schema.name_col} LIKE ?",
-                (like,)
-            )
-        rows = cur.fetchall()
-        results = [_row_to_place_dict(r, cols, schema, cur) for r in rows]
-        return results[:limit]
+    like = f"%{q}%"
 
+    with closing(_open()) as con, closing(con.cursor()) as cur:
+        cur.execute(
+            """
+            SELECT name, country_code, population, latitude, longitude, feature_class, feature_code
+            FROM places
+            WHERE name LIKE ? COLLATE NOCASE
+            ORDER BY population DESC NULLS LAST
+            LIMIT ?
+            """,
+            (like, int(limit))
+        )
+        rows = cur.fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for (name, cc, pop, lat, lon, fclass, fcode) in rows:
+            country_name = _country_name_from_code(cur, cc) or cc
+            out.append({
+                "type": "place",
+                "name": name,
+                "country_code": cc,
+                "country": country_name,
+                "population": int(pop) if pop is not None else None,
+                "lat": float(lat) if lat is not None else None,
+                "lon": float(lon) if lon is not None else None,
+                "feature_class": fclass,
+                "feature_code": fcode,
+            })
+        return out
 
 def best_match(query: str) -> Optional[Dict[str, Any]]:
+    """Beste Übereinstimmung für einen Ortsnamen – exakter Normalisierungs-Vergleich, sonst größte Bevölkerung."""
     candidates = search_places(query, limit=10)
     if not candidates:
         return None
+
     qn = _normalize(query)
-    # exact normalized match first
     for c in candidates:
         if _normalize(c["name"]) == qn:
             return c
-    # else take highest population if present
     with_pop = [c for c in candidates if c.get("population") is not None]
     if with_pop:
         return max(with_pop, key=lambda x: x["population"])
     return candidates[0]
 
-# Countries via iso2 table (name search)
-
 def search_country_by_name(query: str) -> Optional[Dict[str, Any]]:
-    if not query:
+    """
+    Länder-Suche über iso2: unterstützt engl. Namen + ISO2 + einfache DE-Synonyme.
+    Gibt ein 'country'-Dict zurück (ohne Koordinaten).
+    """
+    q_raw = (query or "").strip()
+    if not q_raw:
         return None
-    like = f"%{query}%"
-    with closing(_open()) as conn, closing(conn.cursor()) as cur:
+    q = q_raw.lower()
+    like = f"%{q_raw}%"
+
+    with closing(_open()) as con, closing(con.cursor()) as cur:
+        # Direkter Name (englisch in iso2.name)
         try:
-            cur.execute("SELECT name, code FROM iso2 WHERE name LIKE ? COLLATE NOCASE", (like,))
+            cur.execute("SELECT name, code FROM iso2 WHERE name LIKE ? COLLATE NOCASE LIMIT 1", (like,))
             row = cur.fetchone()
             if row:
                 name, code = row
-                return {"type":"country","name": name, "country": name, "iso2": code,
-                        "population": None, "lat": None, "lon": None}
-        except sqlite3.Error:
-            return None
+                return {"type": "country", "name": name, "country": name, "iso2": code}
+        except Exception:
+            pass
+
+        # ISO2-Code direkt
+        try:
+            cur.execute("SELECT name, code FROM iso2 WHERE code = ? COLLATE NOCASE LIMIT 1", (q_raw.upper(),))
+            row = cur.fetchone()
+            if row:
+                name, code = row
+                return {"type": "country", "name": name, "country": name, "iso2": code}
+        except Exception:
+            pass
+
+        # Synonyme (de->en/code)
+        for syn in COUNTRY_SYNONYMS.get(q, []):
+            # als Name
+            try:
+                cur.execute("SELECT name, code FROM iso2 WHERE name LIKE ? COLLATE NOCASE LIMIT 1", (f"%{syn}%",))
+                row = cur.fetchone()
+                if row:
+                    name, code = row
+                    return {"type": "country", "name": name, "country": name, "iso2": code}
+            except Exception:
+                pass
+            # als Code
+            try:
+                cur.execute("SELECT name, code FROM iso2 WHERE code = ? COLLATE NOCASE LIMIT 1", (syn.upper(),))
+                row = cur.fetchone()
+                if row:
+                    name, code = row
+                    return {"type": "country", "name": name, "country": name, "iso2": code}
+            except Exception:
+                pass
     return None
 
-# Unified free-text resolver
+# --------- Parsing/Resolver für Texte (nur Geo – kein Wetter) ---------
+_LOC_PAT = re.compile(r"\b(?:in|über|zu|nach|für)\s+([A-Za-zÄÖÜäöüß\-’']+)", re.IGNORECASE)
+_WHERE_IS_PAT = re.compile(r"\b(?:wo\s+ist|where\s+is)\s+([A-Za-zÄÖÜäöüß\-’']+)", re.IGNORECASE)
 
 def _guess_place_query(text: str, ctx: Dict[str, Any] | None = None) -> Optional[str]:
     if not text:
         return None
-    if isinstance(ctx, dict):
-        slots = ctx.get("slots") or {}
-        if isinstance(slots, dict) and slots.get("where"):
-            w = str(slots["where"]).strip()
-            if w:
-                return w
+    # 1) explizite "in/über/..." <Ort>
     m = _LOC_PAT.search(text)
     if m:
-        return m.group(1).strip()
+        return m.group(1)
+    # 2) "wo ist <Ort>"
     m2 = _WHERE_IS_PAT.search(text)
     if m2:
-        return m2.group(1).strip()
-    tokens = _tokenize(text)
+        return m2.group(1)
+    # 3) Fallback: letztes Token
+    tokens = re.findall(r"[A-Za-zÄÖÜäöüß\-’']+", text)
     if tokens:
-        return tokens[-1].strip()
+        return tokens[-1]
     return None
 
-
-def resolve_place(text: str, ctx: Dict[str, Any] | None = None) -> Optional[Dict[str, Any]]:
-    q = _guess_place_query(text, ctx)
+def resolve_place(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Versucht zuerst 'places', dann 'iso2' (als country) – gibt entweder
+    ein 'place'-Dict (mit lat/lon) oder ein 'country'-Dict zurück.
+    """
+    q = _guess_place_query(text) or (text or "").strip()
     if not q:
         return None
-    q = q[:1].upper() + q[1:]
-    try:
-        place = best_match(q)
-        if place:
-            return place
-    except Exception:
-        pass
-    # try country lookup
+    hit = best_match(q)
+    if hit:
+        return hit
     return search_country_by_name(q)
 
-# Speaking geo-skill (kept for Q&A)
-
-def geo_skill(text: str, ctx: Dict[str, Any] | None = None) -> str:
-    place = resolve_place(text, ctx)
+# --------- Ausgabe für Geo-Infos ---------
+def format_place_info(place: Dict[str, Any]) -> str:
+    """Erzeugt einen klaren Info-Text über einen Ort/Land (ohne Wetter)."""
     if not place:
-        return "Sag mir einen Ort, z. B. 'Infos über Zürich'."
+        return "Ich konnte den Ort nicht finden."
+
     if place.get("type") == "country":
-        return f"{place['name']} (Land) – nenn mir eine Stadt darin, z. B. Hauptstadt."
-    name = place.get("name") or "Unbekannt"
-    country = place.get("country") or "–"
+        return f"{place['name']} (Land)."
+
+    name = place.get("name", "Unbekannt")
+    country = place.get("country") or place.get("country_code") or "–"
     pop = place.get("population")
-    lat = place.get("lat"); lon = place.get("lon")
+    lat, lon = place.get("lat"), place.get("lon")
     parts = [f"{name} – {country}"]
     if pop is not None:
-        parts.append(f"Einwohner: {pop:,}".replace(",","."))
-    if isinstance(lat,(int,float)) and isinstance(lon,(int,float)):
+        parts.append(f"Einwohner: {pop:,}".replace(",", "."))
+    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
         parts.append(f"Koordinaten: {lat:.4f}, {lon:.4f}")
     return " | ".join(parts)
+
+def geo_skill(text: str, ctx: Dict[str, Any] | None = None) -> str:
+    """Geo-Infos NUR auf Nachfrage: liefert beschreibenden Text – kein Wetter!"""
+    place = resolve_place(text)
+    if not place:
+        return "Sag mir einen Ort, z. B. 'Infos über Zürich'."
+    return format_place_info(place)

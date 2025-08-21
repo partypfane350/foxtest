@@ -7,86 +7,88 @@ import joblib
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier
 
-# === Skills ===
-from fox.weather import get_weather
-from fox.geo import geo_skill, resolve_place, ensure_geo_db
-from fox.calc import try_auto_calc
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo  
+except ImportError:
+    ZoneInfo = None  
+
+
+TIMEZONE = os.getenv("FOX_TZ", "Europe/Zurich")
+
+# === Skills ===      
+from fox.weather import get_weather    
+from fox.mathe import try_auto_calc    
 
 # ========= Pfade =========
-MODEL_PATH      = Path("fox_intent.pkl")
-FACTS_PATH      = "facts.json"
-TRAIN_PATH      = "train_data.json"
-CALENDAR_PATH   = "calendar.json"
+MODEL_PATH    = Path("fox_intent.pkl")
+TRAIN_PATH    = "train_data.json"
+FACTS_PATH    = "facts.json"
+CALENDAR_PATH = "calendar.json"
 
-# ========= Labels =========
-# Keep only what we actually route. Old labels get normalized (see normalize_label).
+# ========= Labels (nur was geroutet wird) =========
 CLASSES = [
     "smalltalk",
-    "geo",
-    "rechner",
-    "wetter",
+    "geo",        
+    "mathe",     
+    "wetter",     
     "wissen",
     "zeitfrage",
     "termin",
 ]
 
+# Legacy-Mapping (alte Trainingslabels → neue Taxonomie)
 def normalize_label(lbl: str) -> str:
-    # Map legacy labels to current ones so routing stays stable with old training data
     mapping = {
-        "termine": "termin",
+        
+        "rechner": "mathe",
+        
+        "mathfrage": "mathe",
+        
         "stadtfrage": "geo",
+        
         "kontinentfrage": "geo",
-        "mathfrage": "rechner",
+        
+        "termine": "termin",
+        
+        "zeitfrage": "zeitfrage",
+        
+        "wetter": "wetter",
+
     }
     return mapping.get(lbl, lbl)
 
 # ========= JSON-Utils =========
 def load_json(path, default):
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(path, "r", encoding="utf-8") as f: return json.load(f)
     return default
 
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# ========= Start-Trainingsdaten =========
+# ========= Start-Trainingsdaten (kurz, alte Labels bleiben – werden normalisiert) =========
 train_texts = [
-    # Smalltalk
-    "Wie geht es dir?", "Erzähl mir einen Witz", "Hallo Fox", "Was kannst du alles?",
-    # Mathefragen
-    "Was ist 2 + 2?", "Was ist 3 * 5?", "Was ist 10 - 4?", "Was ist 8 / 2?",
-    # Stadtfragen
-    "Welche Städte gibt es in Deutschland?", "Welche Städte hat Deutschland?",
-    "Liste alle Städte in Japan", "Welche Städte gibt es in Italien?",
-    # Kontinente
-    "Welche Kontinente gibt es?", "Nenne mir alle Kontinente",
-    "Was sind die Kontinente der Erde?", "Welche Kontinente kennst du?",
-    # Zeitfragen    
-    "Wie spät ist es?", "Wie viel Uhr haben wir?", "Sag mir die Uhrzeit", "Was ist die aktuelle Uhrzeit?",
-    # Wetterfragen
-    "Wie ist das Wetter heute?", "Wie wird das Wetter morgen?",
-    "Wird es heute regnen?", "Wie ist die Wettervorhersage für diese Woche?",
-    # Wissen
-    "wer ist der erste Mensch auf dem Mond?", "Wer hat die Relativitätstheorie entwickelt?",
-    "Was ist die größte Stadt der Welt?", "Was ist die kleinste Stadt der Welt?",
-    # Termine
-    "Wann ist Weihnachten?", "Wann ist Silvester?", "Wann ist der nächste Feiertag?", "Wann ist dein Geburtstag?"
+    "Wie geht es dir?","Erzähl mir einen Witz","Hallo Fox","Was kannst du alles?",
+    "Was ist 2 + 2?","Was ist 3 * 5?","Was ist 10 - 4?","Was ist 8 / 2?",
+    "Welche Städte gibt es in Deutschland?","Liste alle Städte in Japan",
+    "Welche Kontinente gibt es?","Nenne mir alle Kontinente",
+    "Wie spät ist es?","Sag mir die Uhrzeit",
+    "Wie ist das Wetter heute?","Wie wird das Wetter morgen?",
+    "Wer hat die Relativitätstheorie entwickelt?","Was ist die größte Stadt der Welt?",
+    "Wann ist Weihnachten?","Wann ist dein Geburtstag?"
 ]
-
-# Keep training labels as-is; we'll normalize at inference time
 train_labels = [
     "smalltalk","smalltalk","smalltalk","smalltalk",
     "mathfrage","mathfrage","mathfrage","mathfrage",
-    "stadtfrage","stadtfrage","stadtfrage","stadtfrage",
-    "kontinentfrage","kontinentfrage","kontinentfrage","kontinentfrage",
-    "zeitfrage","zeitfrage","zeitfrage","zeitfrage",
-    "wetter","wetter","wetter","wetter",
-    "wissen","wissen","wissen","wissen",
-    "termine","termine","termine","termine"
+    "stadtfrage","stadtfrage",
+    "kontinentfrage","kontinentfrage",
+    "zeitfrage","zeitfrage",
+    "wetter","wetter",
+    "wissen","wissen",
+    "termine","termine"
 ]
-
 persisted = load_json(TRAIN_PATH, {"texts": [], "labels": []})
 if persisted.get("texts"):  train_texts += persisted["texts"]
 if persisted.get("labels"): train_labels += persisted["labels"]
@@ -101,90 +103,59 @@ def fit_fresh():
     X = vectorizer.fit_transform(train_texts)
     clf = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3, random_state=42)
     clf.fit(X, train_labels)
-    hist = {"n_samples": len(train_texts)}
-    joblib.dump((clf, vectorizer, hist), MODEL_PATH)
-    return hist
+    joblib.dump((clf, vectorizer, {"n_samples": len(train_texts)}), MODEL_PATH)
 
 def build_or_load():
     global vectorizer, clf
     if MODEL_PATH.exists():
         data = joblib.load(MODEL_PATH)
         if isinstance(data, tuple) and len(data) == 3:
-            clf_loaded, vec_loaded, hist = data
+            clf, vectorizer, _ = data
         else:
-            clf_loaded, vec_loaded = data
-            hist = {"n_samples": "?"}
-        clf, vectorizer = clf_loaded, vec_loaded
-        return hist
-    return fit_fresh()
-
-def refit_after_learn():
-    hist = fit_fresh()
-    return hist
-
-# ========= Slots =========
-WEEKDAYS = ["montag","dienstag","mittwoch","donnerstag","freitag","samstag","sonntag"]
-
-def extract_datetime(text: str):
-    t = text.lower()
-    when = None
-    if "heute" in t: when = "heute"
-    elif "morgen" in t: when = "morgen"
+            clf, vectorizer = data
     else:
+        fit_fresh()
+
+# ========= Slots (nur Datum/Uhrzeit – Ort wird NICHT vorgelöst) =========
+WEEKDAYS = ["montag","dienstag","mittwoch","donnerstag","freitag","samstag","sonntag"]
+def extract_datetime(text: str):
+    t = (text or "").lower()
+    when = "heute" if "heute" in t else ("morgen" if "morgen" in t else None)
+    if not when:
         for wd in WEEKDAYS:
             if wd in t: when = wd; break
     m = re.search(r"(\d{1,2})[:.](\d{2})", t)
     clock = f"{int(m.group(1)):02d}:{int(m.group(2)):02d}" if m else None
     return {"when": when, "time": clock}
 
-# ========= Speicher-Funktionen =========
-
-def add_fact(key: str, value: str):
-    facts = load_json(FACTS_PATH, {})
-    facts[key] = value
-    save_json(FACTS_PATH, facts)
-    return facts
-
-def add_training(text: str, label: str):
-    data = load_json(TRAIN_PATH, {"texts": [], "labels": []})
-    data["texts"].append(text); data["labels"].append(label)
-    save_json(TRAIN_PATH, data)
-
-def add_event_free(text: str):
-    evts = load_json(CALENDAR_PATH, [])
-    dt = extract_datetime(text)
-    evts.append({"text": text, "when": dt["when"], "time": dt["time"]})
-    save_json(CALENDAR_PATH, evts)
-    return evts[-1]
-
 # ========= Skills =========
-
 def smalltalk_skill(text, ctx):
-    if "witz" in text.lower():
+    if "witz" in (text or "").lower():
         return "Treffen sich zwei Bytes. Sagt das eine: 'WLAN hier?' — 'Nee, nur LAN.'"
     return "Alles gut! Was brauchst du?"
 
 def time_skill(text, ctx):
-    return "Es ist gerade " + time.strftime("%H:%M")
+    tz = ZoneInfo(TIMEZONE) if ZoneInfo else None
+    now = datetime.now(tz) if tz else datetime.now()
+    t = text.lower() if text else ""
+    if "datum" in t or "tag" in t:
+        return f"Heute ist {now:%A, %d.%m.%Y} – es ist {now:%H:%M}"
+    return f"Es ist gerade {now:%H:%M}"
 
-def calc_skill(text, ctx):
+def mathe_skill(text, ctx):
     res = try_auto_calc(text)
     return f"Ergebnis: {res}" if res is not None else "Sag mir einen Ausdruck, z. B. 12*7."
 
-def weather_skill(text, ctx):
-    # Prefer slot-resolved place
-    slots = ctx.get("slots") or {}
-    place = slots.get("where")
-    if not place:
-        place = resolve_place(text, ctx)
-    if not place:
-        return "Sag mir eine Stadt für Wetter (z. B. 'in Bern')."
-    if place.get("type") == "country" or not place.get("lat") or not place.get("lon"):
-        return f"'{place.get('name','das Land')}' ist zu groß. Nenn mir eine Stadt darin (z. B. 'Bern')."
-    return get_weather(place["name"])  # If your API supports coords, pass lat/lon here.
-
-def geo_skill_main(text, ctx):
+def geo_info_skill(text, ctx):
+    from fox.geo import geo_skill
     return geo_skill(text, ctx)
+
+def weather_skill(text, ctx):
+    m = re.search(r"\bin\s+(.+)$", text or "", flags=re.IGNORECASE)
+    q = (m.group(1) if m else text or "").strip()
+    if not q:
+        return "Sag mir eine Stadt für Wetter (z. B. 'Wetter in Bern')."
+    return get_weather(q)
 
 def wiki_skill(text, ctx):
     return "(Demo) Wissensfrage – später Wikipedia/DB anbinden."
@@ -193,71 +164,52 @@ def calendar_skill(text, ctx):
     dt = extract_datetime(text)
     if not dt["when"] and not dt["time"]:
         return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."
-    ev = add_event_free(text)
-    return f"Okay, Termin gespeichert: {ev.get('when') or ''} {ev.get('time') or ''}".strip()
+    evts = load_json(CALENDAR_PATH, [])
+    evts.append({"text": text, "when": dt["when"], "time": dt["time"]})
+    save_json(CALENDAR_PATH, evts)
+    return f"Okay, Termin gespeichert: {(dt['when'] or '')} {(dt['time'] or '')}".strip()
 
 def fallback_skill(text, ctx):
     return "Das weiß ich noch nicht. Erklär mir kurz, was du brauchst – dann lerne ich es."
 
 # ========= Routing =========
-
 def route(label, text, ctx):
-    # Normalize legacy labels to current
     label = normalize_label(label)
 
-    # --- Smalltalk & Zeit ---
-    if label == "smalltalk":
-        return smalltalk_skill(text, ctx)
-    if label == "zeitfrage":
-        return time_skill(text, ctx)
+    if label == "smalltalk":  return smalltalk_skill(text, ctx)
+    if label == "zeitfrage":  return time_skill(text, ctx)
 
-    # --- Wissen & Geo ---
-    if label == "geo":
-        return geo_skill_main(text, ctx)
-    if label == "wissen":
-        return wiki_skill(text, ctx)
+    if label == "geo":        return geo_info_skill(text, ctx)   # nur Infos aus DB
+    if label == "wissen":     return wiki_skill(text, ctx)
 
-    # --- Wetter ---
-    if label == "wetter":
-        return weather_skill(text, ctx)
+    if label == "wetter":     return weather_skill(text, ctx)    # NUR wenn explizit gefragt
+    if label == "mathe":      return mathe_skill(text, ctx)
 
-    # --- Rechnen ---
-    if label == "rechner":
-        return calc_skill(text, ctx)
+    if label == "termin":     return calendar_skill(text, ctx)
 
-    # --- Termine ---
-    if label == "termin":
-        return calendar_skill(text, ctx)
-
-    # --- Fallback ---
     return fallback_skill(text, ctx)
 
 # ========= Orchestrator =========
 memory = deque(maxlen=200)
 
 def handle(user: str) -> str:
+    # Schnelles Mathe-Autodetect – unabhängig von Intent
     auto = try_auto_calc(user)
     if auto is not None:
         reply = f"Das Ergebnis ist {round(auto, 6)}."
-        memory.append({"user": user, "fox": reply, "via": "auto-calc"})
+        memory.append({"user": user, "fox": reply, "via": "auto-mathe"})
         return reply
 
     X = vectorizer.transform([user])
     proba = clf.predict_proba(X)[0]
     idx = int(proba.argmax())
-    raw_label = clf.classes_[idx]
-    label = normalize_label(raw_label)
+    label = normalize_label(clf.classes_[idx])
     conf = float(proba[idx])
 
-    # Slots
     slots = extract_datetime(user)
-    # Resolve place via DB and store the FULL dict for richer downstream usage
-    place = resolve_place(user, {"slots": slots, "memory": list(memory)})
-    slots["where"] = place if place else None
 
-    # Guardrails
-    if label == "wetter" and not slots["where"]:
-        return "Für Wetter brauche ich noch einen Ort (z. B. 'in Bern')."
+    # Keine automatische Geo-Ortserkennung hier – Geo & Wetter bleiben getrennt
+
     if label == "termin" and not (slots["when"] or slots["time"]):
         return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."
 
@@ -271,20 +223,14 @@ def handle(user: str) -> str:
     return reply
 
 # ========= CLI =========
-
 def main():
-    print("🦊 Fox Assistant – mit Speicher")
-    print("Befehle:")
+    print("🦊 Fox Assistant (clean) – Befehle:")
     print("  learn: <frage> => <label>")
     print("  fact: <key> = <val>")
     print("  termin: <beschreibung>")
-    print("  save | reload | showmem | showfacts | showtrain | showcal | quit\n")
+    print("  save | reload | showmem | showtrain | quit\n")
 
-    # Ensure geo DB exists (won't override existing)
-    ensure_geo_db(seed_minimal=True)
-
-    hist = build_or_load()
-    print(f"[i] Modell geladen – Beispiele: {hist['n_samples']}")
+    build_or_load()
 
     while True:
         try: user = input("Du: ").strip()
@@ -293,32 +239,24 @@ def main():
         if not user: continue
         l = user.lower()
 
-        if l in ("quit","exit"):
-            print("Bis bald!"); break
+        if l in ("quit","exit"): print("Bis bald!"); break
         if l == "save":
             joblib.dump((clf, vectorizer, {"n_samples": len(train_texts)}), MODEL_PATH)
             print(f"Fox: Modell gespeichert → {MODEL_PATH}")
-            print("Fox: Trainingsdaten sind bereits fix in train_data.json gespeichert ✅")
+            save_json(TRAIN_PATH, {"texts": train_texts, "labels": train_labels})
+            print("Fox: Trainingsdaten gespeichert ✅")
             continue
-        if l == "reload":
-            build_or_load(); print("Fox: Modell neu geladen."); continue
-        if l == "showmem":
-            print(json.dumps(list(memory), ensure_ascii=False, indent=2)); continue
-        if l == "showfacts":
-            print(json.dumps(load_json(FACTS_PATH, {}), ensure_ascii=False, indent=2)); continue
-        if l == "showtrain":
-            print(json.dumps(load_json(TRAIN_PATH, {"texts": [], "labels": []}), ensure_ascii=False, indent=2)); continue
-        if l == "showcal":
-            print(json.dumps(load_json(CALENDAR_PATH, []), ensure_ascii=False, indent=2)); continue
+        if l == "reload": build_or_load(); print("Fox: Modell neu geladen."); continue
+        if l == "showmem": print(json.dumps(list(memory), ensure_ascii=False, indent=2)); continue
+        if l == "showtrain": print(json.dumps({"texts": train_texts, "labels": train_labels}, ensure_ascii=False, indent=2)); continue
 
         if l.startswith("learn:"):
             try:
                 payload = user.split("learn:", 1)[1].strip()
                 q, lab = [p.strip() for p in payload.split("=>", 1)]
-                add_training(q, lab)
                 train_texts.append(q); train_labels.append(lab)
-                hist = refit_after_learn()
-                print(f"Fox: Gelernt → '{q}' => {lab} (Samples: {hist['n_samples']})")
+                fit_fresh()
+                print(f"Fox: Gelernt → '{q}' => {lab} (Samples: {len(train_texts)})")
             except Exception:
                 print("Fox: Nutzung: learn: <frage> => <label>")
             continue
@@ -327,7 +265,8 @@ def main():
             try:
                 payload = user.split("fact:", 1)[1]
                 key, val = [p.strip() for p in payload.split("=", 1)]
-                facts = add_fact(key, val)
+                facts = load_json(FACTS_PATH, {})
+                facts[key] = val; save_json(FACTS_PATH, facts)
                 print(f"Fox: Gemerkt – {key} = {val}. ({len(facts)} Einträge)")
             except Exception:
                 print("Fox: Nutzung: fact: <schlüssel> = <wert>")
@@ -335,8 +274,11 @@ def main():
 
         if l.startswith("termin:"):
             payload = user.split("termin:", 1)[1].strip()
-            ev = add_event_free(payload)
-            print(f"Fox: Termin gespeichert → {ev.get('when') or ''} {ev.get('time') or ''} – {payload}".strip())
+            dt = extract_datetime(payload)
+            cal = load_json(CALENDAR_PATH, [])
+            cal.append({"text": payload, "when": dt["when"], "time": dt["time"]})
+            save_json(CALENDAR_PATH, cal)
+            print(f"Fox: Termin gespeichert → {dt.get('when') or ''} {dt.get('time') or ''} – {payload}".strip())
             continue
 
         reply = handle(user)
