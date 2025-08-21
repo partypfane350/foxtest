@@ -1,2 +1,4 @@
 geo_data/geo.db
 __pycache__
+*.pkl
+train_data.json
