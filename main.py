@@ -153,7 +153,7 @@ def route(label, text, ctx):
     label = normalize_label(label)
 
     if label == "smalltalk":  return smalltalk_skill(text, ctx)
-    if label == "time":       return time_skill(text, ctx)   # ⏰
+    if label == "time":       return time_skill(text, ctx)   
 
     if label == "geo":        return geo_info_skill(text, ctx)
     if label == "wissen":     return wiki_skill(text, ctx)
