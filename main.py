@@ -1,24 +1,17 @@
 from __future__ import annotations
-import re, time, json, os
+import re, json, os
 from pathlib import Path
 from collections import deque
 
 import joblib
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import SGDClassifier
+from sklearn.linear_model import SGDClassifier  # korrektes Modul!
 
-from datetime import datetime
-try:
-    from zoneinfo import ZoneInfo  
-except ImportError:
-    ZoneInfo = None  
-
-
-TIMEZONE = os.getenv("FOX_TZ", "Europe/Zurich")
-
-# === Skills ===      
-from fox.weather import get_weather    
-from fox.mathe import try_auto_calc    
+# === Skills ===
+from fox.geo import geo_skill          # Geo-Infos (DB) – kein Wetter
+from fox.weather import get_weather    # Wetter nur auf explizite Nachfrage
+from fox.mathe import mathe_skill, try_auto_calc   # Mathe
+from fox.time import time_skill        # Time (ausgelagert)
 
 # ========= Pfade =========
 MODEL_PATH    = Path("fox_intent.pkl")
@@ -26,35 +19,26 @@ TRAIN_PATH    = "train_data.json"
 FACTS_PATH    = "facts.json"
 CALENDAR_PATH = "calendar.json"
 
-# ========= Labels (nur was geroutet wird) =========
+# ========= Labels (schlank & konsistent) =========
 CLASSES = [
     "smalltalk",
-    "geo",        
-    "mathe",     
-    "wetter",     
+    "geo",        # Infos über Orte/Länder (DB)
+    "mathe",      # Rechnen
+    "wetter",     # Wetter nur bei expliziter Nachfrage
     "wissen",
-    "zeitfrage",
+    "time",       # <-- statt 'zeitfrage'
     "termin",
 ]
 
 # Legacy-Mapping (alte Trainingslabels → neue Taxonomie)
 def normalize_label(lbl: str) -> str:
     mapping = {
-        
         "rechner": "mathe",
-        
         "mathfrage": "mathe",
-        
         "stadtfrage": "geo",
-        
         "kontinentfrage": "geo",
-        
         "termine": "termin",
-        
-        "zeitfrage": "zeitfrage",
-        
-        "wetter": "wetter",
-
+        "zeitfrage": "time",
     }
     return mapping.get(lbl, lbl)
 
@@ -68,7 +52,7 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# ========= Start-Trainingsdaten (kurz, alte Labels bleiben – werden normalisiert) =========
+# ========= Start-Trainingsdaten =========
 train_texts = [
     "Wie geht es dir?","Erzähl mir einen Witz","Hallo Fox","Was kannst du alles?",
     "Was ist 2 + 2?","Was ist 3 * 5?","Was ist 10 - 4?","Was ist 8 / 2?",
@@ -134,23 +118,15 @@ def smalltalk_skill(text, ctx):
         return "Treffen sich zwei Bytes. Sagt das eine: 'WLAN hier?' — 'Nee, nur LAN.'"
     return "Alles gut! Was brauchst du?"
 
-def time_skill(text, ctx):
-    tz = ZoneInfo(TIMEZONE) if ZoneInfo else None
-    now = datetime.now(tz) if tz else datetime.now()
-    t = text.lower() if text else ""
-    if "datum" in t or "tag" in t:
-        return f"Heute ist {now:%A, %d.%m.%Y} – es ist {now:%H:%M}"
-    return f"Es ist gerade {now:%H:%M}"
-
 def mathe_skill(text, ctx):
     res = try_auto_calc(text)
     return f"Ergebnis: {res}" if res is not None else "Sag mir einen Ausdruck, z. B. 12*7."
 
 def geo_info_skill(text, ctx):
-    from fox.geo import geo_skill
-    return geo_skill(text, ctx)
+    return geo_skill(text, ctx)   # nur Infos aus DB, kein Wetter
 
 def weather_skill(text, ctx):
+    # Wetter nur wenn explizit gefragt – Ort wird NICHT aus Geo gezogen
     m = re.search(r"\bin\s+(.+)$", text or "", flags=re.IGNORECASE)
     q = (m.group(1) if m else text or "").strip()
     if not q:
@@ -177,12 +153,12 @@ def route(label, text, ctx):
     label = normalize_label(label)
 
     if label == "smalltalk":  return smalltalk_skill(text, ctx)
-    if label == "zeitfrage":  return time_skill(text, ctx)
+    if label == "time":       return time_skill(text, ctx)   # ⏰
 
-    if label == "geo":        return geo_info_skill(text, ctx)   # nur Infos aus DB
+    if label == "geo":        return geo_info_skill(text, ctx)
     if label == "wissen":     return wiki_skill(text, ctx)
 
-    if label == "wetter":     return weather_skill(text, ctx)    # NUR wenn explizit gefragt
+    if label == "wetter":     return weather_skill(text, ctx)
     if label == "mathe":      return mathe_skill(text, ctx)
 
     if label == "termin":     return calendar_skill(text, ctx)
@@ -193,7 +169,7 @@ def route(label, text, ctx):
 memory = deque(maxlen=200)
 
 def handle(user: str) -> str:
-    # Schnelles Mathe-Autodetect – unabhängig von Intent
+    # Schnelles Mathe-Autodetect – unabhängig vom Intent
     auto = try_auto_calc(user)
     if auto is not None:
         reply = f"Das Ergebnis ist {round(auto, 6)}."
@@ -207,8 +183,6 @@ def handle(user: str) -> str:
     conf = float(proba[idx])
 
     slots = extract_datetime(user)
-
-    # Keine automatische Geo-Ortserkennung hier – Geo & Wetter bleiben getrennt
 
     if label == "termin" and not (slots["when"] or slots["time"]):
         return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."

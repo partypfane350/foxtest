@@ -1,4 +1,3 @@
-# ehemals calc.py → jetzt Mathe-Modul
 import ast, math, operator as op
 
 _ALLOWED_OPS = {
@@ -32,7 +31,7 @@ def _eval_ast(node):
     raise ValueError("Unerlaubter Ausdruck")
 
 def normalize_expr(text: str) -> str:
-    s = text.lower()
+    s = (text or "").lower()
     for ph in ["was ist","wie viel ist","wie viel sind","rechne","berechne",
                "=","ist gleich","bitte","?"]:
         s = s.replace(ph, " ")
@@ -46,7 +45,7 @@ def safe_calc(expr: str) -> float:
     return _eval_ast(tree.body)
 
 def try_auto_calc(user_text: str):
-    t = user_text.lower()
+    t = (user_text or "").lower()
     has_digit = any(ch.isdigit() for ch in t)
     has_op = any(sym in t for sym in "+-*/×x÷:^%")
     looks_math = (has_digit and has_op) or any(p in t for p in ["was ist","rechne","berechne"])
@@ -57,3 +56,8 @@ def try_auto_calc(user_text: str):
         return safe_calc(expr)
     except Exception:
         return None
+
+# === Skill-Wrapper ===
+def mathe_skill(text: str, ctx: dict | None = None) -> str:
+    res = try_auto_calc(text)
+    return f"Ergebnis: {res}" if res is not None else "Sag mir einen Ausdruck, z. B. 12*7 "

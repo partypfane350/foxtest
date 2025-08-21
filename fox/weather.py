@@ -1,3 +1,4 @@
+# fox/weather.py
 import os
 import requests
 from urllib.parse import quote_plus
@@ -11,7 +12,7 @@ def _clean(s: str) -> str:
 def get_weather(city_or_query: str) -> str:
     """
     Holt Wetter NUR, wenn man es explizit aufruft. Robust gegen Groß/Klein & Spaces.
-    Erwartet eine Stadt (am besten aus DB), aber probiert Varianten durch.
+    Erwartet eine Stadt (am besten aus DB), probiert aber Varianten durch.
     """
     q = _clean(city_or_query)
     if not q:
@@ -19,6 +20,7 @@ def get_weather(city_or_query: str) -> str:
 
     tried = set()
     candidates = [q, q.title()]
+    last = None
     for cand in candidates:
         if not cand or cand.lower() in tried:
             continue
@@ -38,7 +40,6 @@ def get_weather(city_or_query: str) -> str:
                 return f"Wetter in {name}: {temp:.1f}°C, {desc}"
             if r.status_code == 404:
                 continue  # nächste Variante probieren
-            # andere Status → direkt melden
             try:
                 msg = r.json().get("message", "")
             except Exception:
@@ -46,4 +47,4 @@ def get_weather(city_or_query: str) -> str:
             return f"Wetter-Fehler {r.status_code}: {msg or 'unbekannt'}"
         except Exception as e:
             last = f"Fehler beim Wetterabruf: {e}"
-    return last if 'last' in locals() else f"Wetter für '{q}' nicht gefunden."
+    return last or f"Wetter für '{q}' nicht gefunden."
