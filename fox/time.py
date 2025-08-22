@@ -1,10 +1,10 @@
 from datetime import datetime
 try:
-    from zoneinfo import ZoneInfo  # Standard seit Python 3.9
+    from zoneinfo import ZoneInfo  
 except ImportError:
     ZoneInfo = None
 
-from dateutil.tz import gettz  
+from dateutil.tz import gettz    
 
 TIMEZONE = "Europe/Zurich"
 
@@ -33,5 +33,5 @@ def time_skill(text: str, ctx=None) -> str:
     # kleine Logik: falls User nach Datum fragt
     text_lower = text.lower()
     if "datum" in text_lower or "tag" in text_lower:
-        return f"Heute ist {now:%A, %d.%m.%Y} und die Uhrzeit ist {now:%H:%M}"
-    return f"Es ist gerade {now:%H:%M}"
+        return f"Heute ist der {now:%A, %d.%m.%Y}  wir haben {now:%H:%M}"
+    return f"Es ist {now:%H:%M}"

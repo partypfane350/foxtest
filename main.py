@@ -1,238 +1,402 @@
+
 from __future__ import annotations
-import re, json, os
+
+import os
+import re
+import json
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 from collections import deque
+from typing import Dict, Any, List, Optional
 
 import joblib
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import SGDClassifier  # korrektes Modul!
+from sklearn.linear_model import SGDClassifier
 
-# === Skills ===
-from fox.geo import geo_skill          # Geo-Infos (DB) – kein Wetter
-from fox.weather import get_weather    # Wetter nur auf explizite Nachfrage
-from fox.mathe import mathe_skill, try_auto_calc   # Mathe
-from fox.time import time_skill        # Time (ausgelagert)
+# === Skills/Module ===
+from fox.geo import geo_skill                 
+from fox.weather import get_weather            
+from fox.mathe import try_auto_calc, mathe_skill as mathe_skill_lib
+from fox.time import time_skill               
 
-# ========= Pfade =========
-MODEL_PATH    = Path("fox_intent.pkl")
-TRAIN_PATH    = "train_data.json"
-FACTS_PATH    = "facts.json"
-CALENDAR_PATH = "calendar.json"
+# ==== sprach Ein-/Ausgabe ====
+from fox.speech_in import SpeechIn as VoskSpeechIn       
+from fox.speech_out import Speech     
 
-# ========= Labels (schlank & konsistent) =========
+# =========================
+# Konfiguration & Konstanten
+# =========================
+
+MODEL_PATH       = Path("fox_intent.pkl")
+TRAIN_PATH       = Path("train_data.json")
+FACTS_PATH       = Path("facts.json")
+CALENDAR_PATH    = Path("calendar.json")
+
+CONF_THRESHOLD   = 0.60   # Mindest-Konfidenz fürs Modell-Routing
+MEMORY_SIZE      = 200    # Verlaufsspeicher (leichtgewichtig)
+RANDOM_STATE     = 42     # Reproduzierbarkeit
+SGD_MAX_ITER     = 1000
+SGD_TOL          = 1e-3
+
 CLASSES = [
     "smalltalk",
-    "geo",        # Infos über Orte/Länder (DB)
+    "geo",        # Orte/Länder-Infos
     "mathe",      # Rechnen
-    "wetter",     # Wetter nur bei expliziter Nachfrage
-    "wissen",
-    "time",       # <-- statt 'zeitfrage'
-    "termin",
+    "wetter",     # nur explizit
+    "wissen",     # Platzhalter
+    "time",       # Zeit/Datum
+    "termin",     # kleiner Kalender
 ]
+# wissen bearbeiten 
 
-# Legacy-Mapping (alte Trainingslabels → neue Taxonomie)
+LEGACY_MAP = {
+    "rechner": "mathe",
+    "mathfrage": "mathe",
+    "stadtfrage": "geo",
+    "kontinentfrage": "geo",
+    "termine": "termin",
+    "zeitfrage": "time",
+}
+
+WEEKDAYS = ["montag","dienstag","mittwoch","donnerstag","freitag","samstag","sonntag"]
+
+# Start-Trainingsdaten (klein & zielgerichtet)
+BASE_TRAIN = {
+    "texts": [
+        "Wie geht es dir?", "Erzähl mir einen Witz", "Hallo Fox", "Was kannst du alles?",
+        "Was ist 2 + 2?", "Was ist 3 * 5?", "Was ist 10 - 4?", "Was ist 8 / 2?",
+        "Welche Städte gibt es in Deutschland?", "Liste alle Städte in Japan",
+        "Welche Kontinente gibt es?", "Nenne mir alle Kontinente",
+        "Wie spät ist es?", "Sag mir die Uhrzeit",
+        "Wie ist das Wetter heute?", "Wie wird das Wetter morgen?",
+        "Wer hat die Relativitätstheorie entwickelt?", "Was ist die größte Stadt der Welt?",
+        "Wann ist Weihnachten?", "Wann ist dein Geburtstag?"
+    ],
+    "labels": [
+        "smalltalk","smalltalk","smalltalk","smalltalk",
+        "mathe","mathe","mathe","mathe",
+        "geo","geo",
+        "geo","geo",              
+        "time","time",
+        "wetter","wetter",
+        "wissen","wissen",
+        "termin","termin"
+    ]
+}
+
+# ==========
+# Utilities
+# ==========
+
 def normalize_label(lbl: str) -> str:
-    mapping = {
-        "rechner": "mathe",
-        "mathfrage": "mathe",
-        "stadtfrage": "geo",
-        "kontinentfrage": "geo",
-        "termine": "termin",
-        "zeitfrage": "time",
-    }
-    return mapping.get(lbl, lbl)
+    return LEGACY_MAP.get(lbl, lbl)
 
-# ========= JSON-Utils =========
-def load_json(path, default):
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f: return json.load(f)
+def load_json(path: Path, default):
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
     return default
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
+def save_json(path: Path, data) -> None:
+    with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# ========= Start-Trainingsdaten =========
-train_texts = [
-    "Wie geht es dir?","Erzähl mir einen Witz","Hallo Fox","Was kannst du alles?",
-    "Was ist 2 + 2?","Was ist 3 * 5?","Was ist 10 - 4?","Was ist 8 / 2?",
-    "Welche Städte gibt es in Deutschland?","Liste alle Städte in Japan",
-    "Welche Kontinente gibt es?","Nenne mir alle Kontinente",
-    "Wie spät ist es?","Sag mir die Uhrzeit",
-    "Wie ist das Wetter heute?","Wie wird das Wetter morgen?",
-    "Wer hat die Relativitätstheorie entwickelt?","Was ist die größte Stadt der Welt?",
-    "Wann ist Weihnachten?","Wann ist dein Geburtstag?"
-]
-train_labels = [
-    "smalltalk","smalltalk","smalltalk","smalltalk",
-    "mathfrage","mathfrage","mathfrage","mathfrage",
-    "stadtfrage","stadtfrage",
-    "kontinentfrage","kontinentfrage",
-    "zeitfrage","zeitfrage",
-    "wetter","wetter",
-    "wissen","wissen",
-    "termine","termine"
-]
-persisted = load_json(TRAIN_PATH, {"texts": [], "labels": []})
-if persisted.get("texts"):  train_texts += persisted["texts"]
-if persisted.get("labels"): train_labels += persisted["labels"]
-
-# ========= Intent-Model =========
-vectorizer: TfidfVectorizer | None = None
-clf: SGDClassifier | None = None
-
-def fit_fresh():
-    global vectorizer, clf
-    vectorizer = TfidfVectorizer()
-    X = vectorizer.fit_transform(train_texts)
-    clf = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3, random_state=42)
-    clf.fit(X, train_labels)
-    joblib.dump((clf, vectorizer, {"n_samples": len(train_texts)}), MODEL_PATH)
-
-def build_or_load():
-    global vectorizer, clf
-    if MODEL_PATH.exists():
-        data = joblib.load(MODEL_PATH)
-        if isinstance(data, tuple) and len(data) == 3:
-            clf, vectorizer, _ = data
-        else:
-            clf, vectorizer = data
-    else:
-        fit_fresh()
-
-# ========= Slots (nur Datum/Uhrzeit – Ort wird NICHT vorgelöst) =========
-WEEKDAYS = ["montag","dienstag","mittwoch","donnerstag","freitag","samstag","sonntag"]
-def extract_datetime(text: str):
+def extract_datetime(text: str) -> Dict[str, Optional[str]]:
     t = (text or "").lower()
     when = "heute" if "heute" in t else ("morgen" if "morgen" in t else None)
     if not when:
         for wd in WEEKDAYS:
-            if wd in t: when = wd; break
+            if wd in t:
+                when = wd
+                break
     m = re.search(r"(\d{1,2})[:.](\d{2})", t)
     clock = f"{int(m.group(1)):02d}:{int(m.group(2)):02d}" if m else None
     return {"when": when, "time": clock}
 
-# ========= Skills =========
-def smalltalk_skill(text, ctx):
-    if "witz" in (text or "").lower():
-        return "Treffen sich zwei Bytes. Sagt das eine: 'WLAN hier?' — 'Nee, nur LAN.'"
-    return "Alles gut! Was brauchst du?"
-
-def mathe_skill(text, ctx):
-    res = try_auto_calc(text)
-    return f"Ergebnis: {res}" if res is not None else "Sag mir einen Ausdruck, z. B. 12*7."
-
-def geo_info_skill(text, ctx):
-    return geo_skill(text, ctx)   # nur Infos aus DB, kein Wetter
-
-def weather_skill(text, ctx):
-    # Wetter nur wenn explizit gefragt – Ort wird NICHT aus Geo gezogen
+def extract_weather_query(text: str) -> str:
     m = re.search(r"\bin\s+(.+)$", text or "", flags=re.IGNORECASE)
     q = (m.group(1) if m else text or "").strip()
-    if not q:
-        return "Sag mir eine Stadt für Wetter (z. B. 'Wetter in Bern')."
-    return get_weather(q)
+    return q
 
-def wiki_skill(text, ctx):
-    return "(Demo) Wissensfrage – später Wikipedia/DB anbinden."
+# ==========
+# Logging
+# ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("fox")
 
-def calendar_skill(text, ctx):
-    dt = extract_datetime(text)
-    if not dt["when"] and not dt["time"]:
-        return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."
-    evts = load_json(CALENDAR_PATH, [])
-    evts.append({"text": text, "when": dt["when"], "time": dt["time"]})
-    save_json(CALENDAR_PATH, evts)
-    return f"Okay, Termin gespeichert: {(dt['when'] or '')} {(dt['time'] or '')}".strip()
+for name in ("comtypes", "comtypes.client", "comtypes.gen", "pyttsx3"):
+    lg = logging.getLogger(name)
+    lg.setLevel(logging.WARNING)   
+    lg.propagate = False
 
-def fallback_skill(text, ctx):
-    return "Das weiß ich noch nicht. Erklär mir kurz, was du brauchst – dann lerne ich es."
+# ===========================
+# ML: Vektorisierer & Klassif.
+# ===========================
 
-# ========= Routing =========
-def route(label, text, ctx):
-    label = normalize_label(label)
+@dataclass
+class IntentModel:
+    clf: SGDClassifier
+    vectorizer: TfidfVectorizer
+    meta: Dict[str, Any]
 
-    if label == "smalltalk":  return smalltalk_skill(text, ctx)
-    if label == "time":       return time_skill(text, ctx)   
+    @staticmethod
+    def fit_from_texts(texts: List[str], labels: List[str]) -> "IntentModel":
+        vec = TfidfVectorizer()
+        X = vec.fit_transform(texts)
+        clf = SGDClassifier(loss="log_loss", max_iter=SGD_MAX_ITER, tol=SGD_TOL, random_state=RANDOM_STATE)
+        clf.fit(X, labels)
+        return IntentModel(clf=clf, vectorizer=vec, meta={"n_samples": len(texts)})
 
-    if label == "geo":        return geo_info_skill(text, ctx)
-    if label == "wissen":     return wiki_skill(text, ctx)
+    def save(self, path: Path) -> None:
+        joblib.dump((self.clf, self.vectorizer, self.meta), path)
 
-    if label == "wetter":     return weather_skill(text, ctx)
-    if label == "mathe":      return mathe_skill(text, ctx)
+    @staticmethod
+    def load(path: Path) -> "IntentModel":
+        data = joblib.load(path)
+        if isinstance(data, tuple) and len(data) == 3:
+            clf, vec, meta = data
+        else:
+            # Abwärtskompatibilität
+            clf, vec = data
+            meta = {}
+        return IntentModel(clf=clf, vectorizer=vec, meta=meta)
 
-    if label == "termin":     return calendar_skill(text, ctx)
+# ==========================
+# Core Assistant Orchestrator
+# ==========================
 
-    return fallback_skill(text, ctx)
+class FoxAssistant:
+    def __init__(self):
+        self.memory = deque(maxlen=MEMORY_SIZE)  
+        # Trainingsdaten laden/mergen
+        persisted = load_json(TRAIN_PATH, {"texts": [], "labels": []})
+        self.train_texts: List[str] = list(BASE_TRAIN["texts"]) + list(persisted.get("texts", []))
+        self.train_labels: List[str] = list(BASE_TRAIN["labels"]) + list(persisted.get("labels", []))
+        # Modell bauen/laden
+        if MODEL_PATH.exists():
+            self.model = IntentModel.load(MODEL_PATH)
+            log.info("Modell geladen (%s).", MODEL_PATH)
+        else:
+            self.model = IntentModel.fit_from_texts(self.train_texts, self.train_labels)
+            self.model.save(MODEL_PATH)
+            log.info("Modell neu trainiert (%d Samples).", len(self.train_texts))
 
-# ========= Orchestrator =========
-memory = deque(maxlen=200)
+    # ===== Skills =====
 
-def handle(user: str) -> str:
-    # Schnelles Mathe-Autodetect – unabhängig vom Intent
-    auto = try_auto_calc(user)
-    if auto is not None:
-        reply = f"Das Ergebnis ist {round(auto, 6)}."
-        memory.append({"user": user, "fox": reply, "via": "auto-mathe"})
+    def smalltalk(self, text: str, ctx: Dict[str, Any]) -> str:
+        if "witz" in (text or "").lower():
+            return "Treffen sich zwei Bytes. Sagt das eine: 'WLAN hier?' — 'Nee, nur LAN.'"
+        return "Alles gut! Was brauchst du?"
+
+    def mathe(self, text: str, ctx: Dict[str, Any]) -> str:
+        """Wrapper, damit wir den Namen 'mathe_skill' aus fox.mathe nicht überschreiben."""
+        res = try_auto_calc(text)
+        if res is not None:
+            return f"Ergebnis: {res}"
+        return mathe_skill_lib(text, ctx)  
+    
+    def geo_info(self, text: str, ctx: Dict[str, Any]) -> str:
+        return geo_skill(text, ctx)
+
+    def wetter(self, text: str, ctx: Dict[str, Any]) -> str:
+        q = extract_weather_query(text)
+        if not q:
+            return "Sag mir eine Stadt für Wetter (z. B. 'Wetter in Bern')."
+        return get_weather(q)
+
+    def wissen(self, text: str, ctx: Dict[str, Any]) -> str:
+        return "(Demo) Wissensfrage – später Wikipedia/DB anbinden."
+
+    def termin(self, text: str, ctx: Dict[str, Any]) -> str:
+        dt = extract_datetime(text)
+        if not dt["when"] and not dt["time"]:
+            return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."
+        evts = load_json(CALENDAR_PATH, [])
+        evts.append({"text": text, "when": dt["when"], "time": dt["time"]})
+        save_json(CALENDAR_PATH, evts)
+        pieces = [p for p in [dt["when"], dt["time"]] if p]
+        return f"Okay, Termin gespeichert: {' '.join(pieces)}".strip()
+
+    def time_now(self, text: str, ctx: Dict[str, Any]) -> str:
+        return time_skill(text, ctx)
+
+    def fallback(self, text: str, ctx: Dict[str, Any]) -> str:
+        return "Das weiß ich noch nicht. Erklär mir kurz, was du brauchst – dann lerne ich es."
+
+    # ===== Routing =====
+
+    def route(self, label: str, text: str, ctx: Dict[str, Any]) -> str:
+        label = normalize_label(label)
+        if label == "smalltalk": return self.smalltalk(text, ctx)
+        if label == "time":      return self.time_now(text, ctx)
+        if label == "geo":       return self.geo_info(text, ctx)
+        if label == "wissen":    return self.wissen(text, ctx)
+        if label == "wetter":    return self.wetter(text, ctx)
+        if label == "mathe":     return self.mathe(text, ctx)
+        if label == "termin":    return self.termin(text, ctx)
+        return self.fallback(text, ctx)
+
+    # ===== Handle =====
+
+    def handle(self, user: str) -> str:
+        # 1) Sofort-Mathe (unabhängig vom Intent)
+        auto = try_auto_calc(user)
+        if auto is not None:
+            reply = f"Das Ergebnis ist {round(auto, 6)}."
+            self._memorize(user, reply, via="auto-mathe")
+            return reply
+
+        # 2) Intent-Klassifizierung
+        X = self.model.vectorizer.transform([user])
+        proba = self.model.clf.predict_proba(X)[0]
+        idx = int(proba.argmax())
+        label = normalize_label(self.model.clf.classes_[idx])
+        conf = float(proba[idx])
+
+        slots = extract_datetime(user)
+
+        # Termin braucht Slots
+        if label == "termin" and not (slots["when"] or slots["time"]):
+            return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."
+
+        # 3) Fallback bei geringer Konfidenz
+        if conf < CONF_THRESHOLD:
+            reply = self.fallback(user, {"slots": slots, "memory": list(self.memory), "conf": conf})
+            self._memorize(user, reply, label=label, conf=conf)
+            return reply
+
+        # 4) Normaler Skill-Rückweg
+        reply = self.route(label, user, {"slots": slots, "memory": list(self.memory), "conf": conf})
+        self._memorize(user, reply, label=label, conf=conf)
         return reply
 
-    X = vectorizer.transform([user])
-    proba = clf.predict_proba(X)[0]
-    idx = int(proba.argmax())
-    label = normalize_label(clf.classes_[idx])
-    conf = float(proba[idx])
+    def _memorize(self, user: str, reply: str, **meta) -> None:
+        self.memory.append({"user": user, "fox": reply, **meta})
 
-    slots = extract_datetime(user)
+    # ===== Training / Persistenz =====
 
-    if label == "termin" and not (slots["when"] or slots["time"]):
-        return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."
+    def fit_fresh(self) -> None:
+        self.model = IntentModel.fit_from_texts(self.train_texts, self.train_labels)
+        self.model.save(MODEL_PATH)
+        log.info("Neu trainiert (%d Samples).", len(self.train_texts))
 
-    if conf < 0.6:
-        reply = fallback_skill(user, {"slots": slots, "memory": list(memory), "conf": conf})
-        memory.append({"user": user, "fox": reply, "label": label, "conf": conf})
-        return reply
+    def learn_pair(self, question: str, label: str) -> None:
+        label = normalize_label(label)
+        if label not in CLASSES:
+            raise ValueError(f"Unbekanntes Label '{label}'. Erlaubt: {', '.join(CLASSES)}")
+        self.train_texts.append(question)
+        self.train_labels.append(label)
+        save_json(TRAIN_PATH, {"texts": self.train_texts, "labels": self.train_labels})
+        self.fit_fresh()
 
-    reply = route(label, user, {"slots": slots, "memory": list(memory), "conf": conf})
-    memory.append({"user": user, "fox": reply, "label": label, "conf": conf})
-    return reply
+    def save_all(self) -> None:
+        self.model.save(MODEL_PATH)
+        save_json(TRAIN_PATH, {"texts": self.train_texts, "labels": self.train_labels})
+        log.info("Modell & Trainingsdaten gespeichert.")
 
-# ========= CLI =========
+# =========
+# CLI-Loop
+# =========
+
 def main():
-    print("🦊 Fox Assistant (clean) – Befehle:")
+    print("🦊 Fox Assistant — Befehle:")
     print("  learn: <frage> => <label>")
     print("  fact: <key> = <val>")
     print("  termin: <beschreibung>")
-    print("  save | reload | showmem | showtrain | quit\n")
+    print("  audio an | audio aus | save | reload | showmem | showtrain | classes | quit\n")
 
-    build_or_load()
+    fox = FoxAssistant()
+    speech = Speech(enabled=True)  
+    mic = VoskSpeechIn(lang="de")  # oder model_path="models/vosk-model-small-de-0.15"
 
     while True:
-        try: user = input("Du: ").strip()
+        try:
+            user = input("Du: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nCiao!"); break
-        if not user: continue
+            print("\nCiao!")
+            break
+        if not user:
+            continue
+
         l = user.lower()
 
-        if l in ("quit","exit"): print("Bis bald!"); break
-        if l == "save":
-            joblib.dump((clf, vectorizer, {"n_samples": len(train_texts)}), MODEL_PATH)
-            print(f"Fox: Modell gespeichert → {MODEL_PATH}")
-            save_json(TRAIN_PATH, {"texts": train_texts, "labels": train_labels})
-            print("Fox: Trainingsdaten gespeichert ✅")
+        if l in ("quit", "exit"):
+            print("Bis bald!")
+            break
+
+        # === Audio-Steuerung (ein/aus) ===
+        if l == "audio an":
+            speech.set_enabled(True)
+            print("Fox: Audio EIN")
             continue
-        if l == "reload": build_or_load(); print("Fox: Modell neu geladen."); continue
-        if l == "showmem": print(json.dumps(list(memory), ensure_ascii=False, indent=2)); continue
-        if l == "showtrain": print(json.dumps({"texts": train_texts, "labels": train_labels}, ensure_ascii=False, indent=2)); continue
+        if l == "audio aus":
+            speech.set_enabled(False)
+            print("Fox: Audio AUS")
+            continue
+        # Liste der Geräte anzeigen
+        if l in ("mikro geraete", "mikro geräte", "mikro devices"):
+            VoskSpeechIn.list_input_devices()
+            continue
+
+        # Aufnahme mit Standardgerät
+        if l == "mikro":
+            heard = mic.listen_once(max_seconds=8)
+            if heard:
+                print(f"Du (Mikro): {heard}")
+                reply = fox.handle(heard)
+                print("Fox:", reply); speech.say(reply)
+            else:
+                msg = "Ich habe nichts verstanden."
+                print("Fox:", msg); speech.say(msg)
+            continue
+
+        # Gerät wechseln: z. B. "mikro device 2"
+        if l.startswith("mikro device "):
+            try:
+                idx = int(l.split()[-1])
+                mic = VoskSpeechIn(lang="de", device=idx)
+                print(f"Fox: Mikrofon auf Device {idx} gesetzt.")
+            except Exception as e:
+                print(f"Fox: Konnte Gerät nicht setzen: {e}")
+            continue
+
+        # === Utility-Befehle ===
+        if l == "save":
+            fox.save_all()
+            print(f"Fox: Modell + Trainingsdaten gespeichert → {MODEL_PATH}")
+            continue
+
+        if l == "reload":
+            fox.model = IntentModel.load(MODEL_PATH)
+            print("Fox: Modell neu geladen.")
+            continue
+
+        if l == "showmem":
+            print(json.dumps(list(fox.memory), ensure_ascii=False, indent=2))
+            continue
+
+        if l == "showtrain":
+            print(json.dumps({"texts": fox.train_texts, "labels": fox.train_labels}, ensure_ascii=False, indent=2))
+            continue
+
+        if l == "classes":
+            print("Klassen:", ", ".join(CLASSES))
+            continue
 
         if l.startswith("learn:"):
             try:
                 payload = user.split("learn:", 1)[1].strip()
                 q, lab = [p.strip() for p in payload.split("=>", 1)]
-                train_texts.append(q); train_labels.append(lab)
-                fit_fresh()
-                print(f"Fox: Gelernt → '{q}' => {lab} (Samples: {len(train_texts)})")
-            except Exception:
-                print("Fox: Nutzung: learn: <frage> => <label>")
+                fox.learn_pair(q, lab)
+                msg = f"Fox: Gelernt → '{q}' => {lab} (Samples: {len(fox.train_texts)})"
+                print(msg); speech.say(msg)
+            except Exception as e:
+                msg = f"Fox: Nutzung: learn: <frage> => <label>. Fehler: {e}"
+                print(msg); speech.say(msg)
             continue
 
         if l.startswith("fact:"):
@@ -241,22 +405,23 @@ def main():
                 key, val = [p.strip() for p in payload.split("=", 1)]
                 facts = load_json(FACTS_PATH, {})
                 facts[key] = val; save_json(FACTS_PATH, facts)
-                print(f"Fox: Gemerkt – {key} = {val}. ({len(facts)} Einträge)")
+                msg = f"Fox: Gemerkt – {key} = {val}. ({len(facts)} Einträge)"
+                print(msg); speech.say(msg)
             except Exception:
-                print("Fox: Nutzung: fact: <schlüssel> = <wert>")
+                msg = "Fox: Nutzung: fact: <schlüssel> = <wert>"
+                print(msg); speech.say(msg)
             continue
 
         if l.startswith("termin:"):
             payload = user.split("termin:", 1)[1].strip()
-            dt = extract_datetime(payload)
-            cal = load_json(CALENDAR_PATH, [])
-            cal.append({"text": payload, "when": dt["when"], "time": dt["time"]})
-            save_json(CALENDAR_PATH, cal)
-            print(f"Fox: Termin gespeichert → {dt.get('when') or ''} {dt.get('time') or ''} – {payload}".strip())
+            reply = fox.termin(payload, ctx={})
+            print("Fox:", reply); speech.say(reply)
             continue
 
-        reply = handle(user)
+        # === Normaler Dialog ===
+        reply = fox.handle(user)
         print("Fox:", reply)
+        speech.say(reply)
 
 if __name__ == "__main__":
     main()
