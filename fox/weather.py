@@ -1,9 +1,8 @@
-# fox/weather.py
 import os
 import requests
 from urllib.parse import quote_plus
 
-API_KEY = os.getenv("OPENWEATHER_KEY", "2b118b7ee7e7b7812a41049225055d22")
+API_KEY = os.getenv("2b118b7ee7e7b7812a41049225055d22")  
 BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 
 def _clean(s: str) -> str:
@@ -14,6 +13,9 @@ def get_weather(city_or_query: str) -> str:
     Holt Wetter NUR, wenn man es explizit aufruft. Robust gegen Groß/Klein & Spaces.
     Erwartet eine Stadt (am besten aus DB), probiert aber Varianten durch.
     """
+    if not API_KEY:
+        return "Kein OPENWEATHER_KEY gesetzt (Umgebungsvariable)."
+
     q = _clean(city_or_query)
     if not q:
         return "Kein Ort angegeben."

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import pyttsx3
 import threading
+import re
 
 class Speech:
     def __init__(self, enabled: bool = True):
@@ -33,7 +34,6 @@ class Speech:
             pass
 
     def say(self, text: str):
-        """Synchron: Spricht den Text (wenn enabled)."""
         if not self.enabled or not text:
             return
         with self._lock:
@@ -43,11 +43,18 @@ class Speech:
                 self.engine.stop()
             except Exception:
                 pass
-            try:
-                self.engine.say(str(text))
-                self.engine.runAndWait()
-            except Exception as e:
-                print(f"[Speech] Warnung: {e}")
+        try:
+            # Spezielle Behandlung für Uhrzeiten
+            if "Es ist" in text and "Uhr" in text:
+                # Text in einzelne Wörter zerlegen und nur die relevanten Teile behalten
+                words = text.split()
+                # Nur "Es ist X Uhr Y" behalten
+                text = " ".join(words[:5]) if len(words) >= 5 else text
+                
+            self.engine.say(text)
+            self.engine.runAndWait()
+        except Exception as e:
+            print(f"[Speech] Warnung: {e}")
 
     def set_enabled(self, on: bool):
         self.enabled = bool(on)

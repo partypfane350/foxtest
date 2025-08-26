@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -9,20 +8,34 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections import deque
 from typing import Dict, Any, List, Optional
+from datetime import datetime  # NEU
 
 import joblib
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier
 
 # === Skills/Module ===
-from fox.geo import geo_skill                 
-from fox.weather import get_weather            
+from fox.geo import geo_skill
+from fox.weather import get_weather
 from fox.mathe import try_auto_calc, mathe_skill as mathe_skill_lib
-from fox.time import time_skill               
+from fox.time import time_skill
 
 # ==== sprach Ein-/Ausgabe ====
-from fox.speech_in import SpeechIn as VoskSpeechIn       
-from fox.speech_out import Speech     
+from fox.speech_in import SpeechIn as VoskSpeechIn
+from fox.speech_out import Speech
+
+# === Labels auslagern ===
+import fox.labels as labels
+from fox.labels import CLASSES, LEGACY_MAP, WEEKDAYS, BASE_TRAIN
+
+# === Snapshots (Backups) aus Projekt-Root ===
+from backup import make_snapshot  
+
+# (optional) Knowledge-DB im CLI initialisieren, falls vorhanden
+try:
+    from fox.knowledge import init_db as init_knowledge_db  
+except Exception:
+    init_knowledge_db = None
 
 # =========================
 # Konfiguration & Konstanten
@@ -39,55 +52,7 @@ RANDOM_STATE     = 42     # Reproduzierbarkeit
 SGD_MAX_ITER     = 1000
 SGD_TOL          = 1e-3
 
-CLASSES = [
-    "smalltalk",
-    "geo",        # Orte/Länder-Infos
-    "mathe",      # Rechnen
-    "wetter",     # nur explizit
-    "wissen",     # Platzhalter
-    "time",       # Zeit/Datum
-    "termin",     # kleiner Kalender
-]
-# wissen bearbeiten 
-
-LEGACY_MAP = {
-    "rechner": "mathe",
-    "mathfrage": "mathe",
-    "stadtfrage": "geo",
-    "kontinentfrage": "geo",
-    "termine": "termin",
-    "zeitfrage": "time",
-}
-
-WEEKDAYS = ["montag","dienstag","mittwoch","donnerstag","freitag","samstag","sonntag"]
-
-# Start-Trainingsdaten (klein & zielgerichtet)
-BASE_TRAIN = {
-    "texts": [
-        "Wie geht es dir?", "Erzähl mir einen Witz", "Hallo Fox", "Was kannst du alles?",
-        "Was ist 2 + 2?", "Was ist 3 * 5?", "Was ist 10 - 4?", "Was ist 8 / 2?",
-        "Welche Städte gibt es in Deutschland?", "Liste alle Städte in Japan",
-        "Welche Kontinente gibt es?", "Nenne mir alle Kontinente",
-        "Wie spät ist es?", "Sag mir die Uhrzeit",
-        "Wie ist das Wetter heute?", "Wie wird das Wetter morgen?",
-        "Wer hat die Relativitätstheorie entwickelt?", "Was ist die größte Stadt der Welt?",
-        "Wann ist Weihnachten?", "Wann ist dein Geburtstag?"
-    ],
-    "labels": [
-        "smalltalk","smalltalk","smalltalk","smalltalk",
-        "mathe","mathe","mathe","mathe",
-        "geo","geo",
-        "geo","geo",              
-        "time","time",
-        "wetter","wetter",
-        "wissen","wissen",
-        "termin","termin"
-    ]
-}
-
-# ==========
-# Utilities
-# ==========
+# ========== Utilities ==========
 
 def normalize_label(lbl: str) -> str:
     return LEGACY_MAP.get(lbl, lbl)
@@ -119,9 +84,7 @@ def extract_weather_query(text: str) -> str:
     q = (m.group(1) if m else text or "").strip()
     return q
 
-# ==========
-# Logging
-# ==========
+# ========== Logging ==========
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
@@ -130,7 +93,7 @@ log = logging.getLogger("fox")
 
 for name in ("comtypes", "comtypes.client", "comtypes.gen", "pyttsx3"):
     lg = logging.getLogger(name)
-    lg.setLevel(logging.WARNING)   
+    lg.setLevel(logging.WARNING)
     lg.propagate = False
 
 # ===========================
@@ -144,12 +107,16 @@ class IntentModel:
     meta: Dict[str, Any]
 
     @staticmethod
-    def fit_from_texts(texts: List[str], labels: List[str]) -> "IntentModel":
+    def fit_from_texts(texts: List[str], labels_: List[str]) -> "IntentModel":
         vec = TfidfVectorizer()
         X = vec.fit_transform(texts)
         clf = SGDClassifier(loss="log_loss", max_iter=SGD_MAX_ITER, tol=SGD_TOL, random_state=RANDOM_STATE)
-        clf.fit(X, labels)
-        return IntentModel(clf=clf, vectorizer=vec, meta={"n_samples": len(texts)})
+        clf.fit(X, labels_)
+        meta = {
+            "n_samples": len(texts),
+            "trained_at": datetime.now().isoformat(timespec="seconds"),  # NEU
+        }
+        return IntentModel(clf=clf, vectorizer=vec, meta=meta)
 
     def save(self, path: Path) -> None:
         joblib.dump((self.clf, self.vectorizer, self.meta), path)
@@ -160,7 +127,6 @@ class IntentModel:
         if isinstance(data, tuple) and len(data) == 3:
             clf, vec, meta = data
         else:
-            # Abwärtskompatibilität
             clf, vec = data
             meta = {}
         return IntentModel(clf=clf, vectorizer=vec, meta=meta)
@@ -171,11 +137,16 @@ class IntentModel:
 
 class FoxAssistant:
     def __init__(self):
-        self.memory = deque(maxlen=MEMORY_SIZE)  
+        self.memory = deque(maxlen=MEMORY_SIZE)
+
         # Trainingsdaten laden/mergen
         persisted = load_json(TRAIN_PATH, {"texts": [], "labels": []})
         self.train_texts: List[str] = list(BASE_TRAIN["texts"]) + list(persisted.get("texts", []))
         self.train_labels: List[str] = list(BASE_TRAIN["labels"]) + list(persisted.get("labels", []))
+
+        # >>> WICHTIG: Legacy-Labels normalisieren (NEU)
+        self.train_labels = [normalize_label(x) for x in self.train_labels]
+
         # Modell bauen/laden
         if MODEL_PATH.exists():
             self.model = IntentModel.load(MODEL_PATH)
@@ -193,12 +164,11 @@ class FoxAssistant:
         return "Alles gut! Was brauchst du?"
 
     def mathe(self, text: str, ctx: Dict[str, Any]) -> str:
-        """Wrapper, damit wir den Namen 'mathe_skill' aus fox.mathe nicht überschreiben."""
         res = try_auto_calc(text)
         if res is not None:
             return f"Ergebnis: {res}"
-        return mathe_skill_lib(text, ctx)  
-    
+        return mathe_skill_lib(text, ctx)
+
     def geo_info(self, text: str, ctx: Dict[str, Any]) -> str:
         return geo_skill(text, ctx)
 
@@ -225,7 +195,10 @@ class FoxAssistant:
         return time_skill(text, ctx)
 
     def fallback(self, text: str, ctx: Dict[str, Any]) -> str:
-        return "Das weiß ich noch nicht. Erklär mir kurz, was du brauchst – dann lerne ich es."
+        conf = ctx.get("conf")
+        if conf is not None:
+            return f"Das weiß ich (noch) nicht (conf={conf:.2f}). Erklär mir kurz, was du brauchst – dann lerne ich es."
+        return "Das weiß ich (noch) nicht. Erklär mir kurz, was du brauchst – dann lerne ich es."
 
     # ===== Routing =====
 
@@ -243,14 +216,14 @@ class FoxAssistant:
     # ===== Handle =====
 
     def handle(self, user: str) -> str:
-        # 1) Sofort-Mathe (unabhängig vom Intent)
+        # 1) Sofort-Mathe
         auto = try_auto_calc(user)
         if auto is not None:
             reply = f"Das Ergebnis ist {round(auto, 6)}."
             self._memorize(user, reply, via="auto-mathe")
             return reply
 
-        # 2) Intent-Klassifizierung
+        # 2) Intent
         X = self.model.vectorizer.transform([user])
         proba = self.model.clf.predict_proba(X)[0]
         idx = int(proba.argmax())
@@ -277,7 +250,17 @@ class FoxAssistant:
     def _memorize(self, user: str, reply: str, **meta) -> None:
         self.memory.append({"user": user, "fox": reply, **meta})
 
-    # ===== Training / Persistenz =====
+    # ===== Snapshots / Training / Persistenz =====
+
+    def snapshot(self, tag: str = "autosave") -> None:
+        targets = [
+            Path("fox_intent.pkl"),
+            Path("train_data.json"),
+            Path("facts.json"),
+            Path("calendar.json"),
+            Path("knowledge.db"),  # falls vorhanden
+        ]
+        make_snapshot(targets, tag=tag)
 
     def fit_fresh(self) -> None:
         self.model = IntentModel.fit_from_texts(self.train_texts, self.train_labels)
@@ -292,26 +275,32 @@ class FoxAssistant:
         self.train_labels.append(label)
         save_json(TRAIN_PATH, {"texts": self.train_texts, "labels": self.train_labels})
         self.fit_fresh()
+        # Direkt persistieren + Snapshot (NEU)
+        self.save_all()
+        self.snapshot(tag="learn")
 
     def save_all(self) -> None:
         self.model.save(MODEL_PATH)
         save_json(TRAIN_PATH, {"texts": self.train_texts, "labels": self.train_labels})
         log.info("Modell & Trainingsdaten gespeichert.")
 
-# =========
-# CLI-Loop
-# =========
+# ========= CLI-Loop =========
 
 def main():
     print("🦊 Fox Assistant — Befehle:")
-    print("  learn: <frage> => <label>")
-    print("  fact: <key> = <val>")
-    print("  termin: <beschreibung>")
-    print("  audio an | audio aus | save | reload | showmem | showtrain | classes | quit\n")
+    print(labels.LABEL_TEXTS["cli"]["help"].rstrip())
+    print(f"Labels geladen aus: {labels.__file__}")
+
+    # Knowledge-DB im CLI initialisieren (falls verfügbar)
+    if init_knowledge_db:
+        try:
+            init_knowledge_db()
+        except Exception as e:
+            print(f"Warnung: Konnte Knowledge-DB nicht initialisieren: {e}")
 
     fox = FoxAssistant()
-    speech = Speech(enabled=True)  
-    mic = VoskSpeechIn(lang="de")  # oder model_path="models/vosk-model-small-de-0.15"
+    speech = Speech(enabled=True)
+    mic = VoskSpeechIn(lang="de")  # oder: model_path="models/vosk-model-small-de-0.15"
 
     while True:
         try:
@@ -337,12 +326,12 @@ def main():
             speech.set_enabled(False)
             print("Fox: Audio AUS")
             continue
-        # Liste der Geräte anzeigen
+
+        # === Mikro-Geräte anzeigen/wechseln ===
         if l in ("mikro geraete", "mikro geräte", "mikro devices"):
             VoskSpeechIn.list_input_devices()
             continue
 
-        # Aufnahme mit Standardgerät
         if l == "mikro":
             heard = mic.listen_once(max_seconds=8)
             if heard:
@@ -354,7 +343,6 @@ def main():
                 print("Fox:", msg); speech.say(msg)
             continue
 
-        # Gerät wechseln: z. B. "mikro device 2"
         if l.startswith("mikro device "):
             try:
                 idx = int(l.split()[-1])
@@ -370,9 +358,18 @@ def main():
             print(f"Fox: Modell + Trainingsdaten gespeichert → {MODEL_PATH}")
             continue
 
+        if l == "backup":  
+            fox.snapshot(tag="manual")
+            print("Fox: Snapshot erstellt (Ordner ./backups).")
+            continue
+
         if l == "reload":
             fox.model = IntentModel.load(MODEL_PATH)
             print("Fox: Modell neu geladen.")
+            continue
+
+        if l == "labelspath":
+            print(f"Fox: Labels-Pfad → {labels.__file__}")
             continue
 
         if l == "showmem":
@@ -380,7 +377,10 @@ def main():
             continue
 
         if l == "showtrain":
-            print(json.dumps({"texts": fox.train_texts, "labels": fox.train_labels}, ensure_ascii=False, indent=2))
+            print(json.dumps(
+                {"texts": fox.train_texts, "labels": fox.train_labels},
+                ensure_ascii=False, indent=2
+            ))
             continue
 
         if l == "classes":

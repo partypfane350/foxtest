@@ -34,4 +34,5 @@ def time_skill(text: str, ctx=None) -> str:
     text_lower = text.lower()
     if "datum" in text_lower or "tag" in text_lower:
         return f"Heute ist der {now:%A, %d.%m.%Y}  wir haben {now:%H:%M}"
-    return f"Es ist {now:%H:%M}"
+    
+    return f"{now.hour} Uhr {now.minute:02d}"

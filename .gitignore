@@ -1,4 +1,91 @@
-geo_data/geo.db
-__pycache__
+# ===== OS / Editor =====
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+
+# ===== Python allgemein =====
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.venv*/
+.env
+.env.*
+*.env
+.eggs/
+*.egg-info/
+dist/
+build/
+site/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.tox/
+.cache/
+coverage.xml
+.coverage*
+htmlcov/
+*.spec
+
+# ===== Projekt: Laufzeit-/Userdaten =====
+backups/                 # Snapshots von backup.py
+
+# --- ALLE Datenbanken ignorieren ---
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# Geo-Daten lokal behalten, aber nicht committen
+geo_data/*
+!geo_data/.keep          # Ausnahme: Platzhalterdatei erlauben
+!geo_data/README.md
+
+# Persönliche JSONs (nicht ins Repo)
+facts.json
+calendar.json
+train_data.json        
+
+# ===== ML/Model-Artefakte =====
 *.pkl
-train_data.json
+fox_intent.pkl
+*.joblib
+models/
+model_cache/
+vosk/
+vosk-model*
+*.onnx
+*.bin
+
+# ===== Logs / Temp =====
+logs/
+*.log
+tmp/
+temp/
+*.tmp
+
+# ===== Audio/Medien (falls erzeugt) =====
+*.wav
+*.mp3
+*.ogg
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+
+# ===== Windows / sonstiges =====
+*.lnk
+
+# ===== (Optional) Start-Skripte mit Secrets =====
+start_fox_server.bat
+start_hotword.bat
+
+# ===== (Optional) lokale Hilfsskripte =====
+fox_quickcheck.ps1
+test_fox_api.ps1
+fox.ps1
+fox_learn.ps1
