@@ -80,12 +80,3 @@ temp/
 # ===== Windows / sonstiges =====
 *.lnk
 
-# ===== (Optional) Start-Skripte mit Secrets =====
-start_fox_server.bat
-start_hotword.bat
-
-# ===== (Optional) lokale Hilfsskripte =====
-fox_quickcheck.ps1
-test_fox_api.ps1
-fox.ps1
-fox_learn.ps1
