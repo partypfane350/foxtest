@@ -31,11 +31,15 @@ from fox.labels import CLASSES, LEGACY_MAP, WEEKDAYS, BASE_TRAIN
 # === Snapshots (Backups) aus Projekt-Root ===
 from backup import make_snapshot  
 
+from dotenv import load_dotenv
+
 # (optional) Knowledge-DB im CLI initialisieren, falls vorhanden
 try:
     from fox.knowledge import init_db as init_knowledge_db  
 except Exception:
     init_knowledge_db = None
+
+load_dotenv()    
 
 # =========================
 # Konfiguration & Konstanten
