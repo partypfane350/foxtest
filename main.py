@@ -56,6 +56,10 @@ RANDOM_STATE     = 42     # Reproduzierbarkeit
 SGD_MAX_ITER     = 1000
 SGD_TOL          = 1e-3
 
+AUTO_LEARN = True            # Auto-Lernen aktivieren
+AUTO_LEARN_MIN_CONF = 0.15   # nur lernen, wenn das Modell überhaupt etwas signalisiert
+AUTO_LEARN_MAX_LEN = 120     # keine zu langen Sätze automatisch lernen
+AUTO_LEARN_BLACKLIST = {}    # diese Labels nicht automatisch lernen
 # ========== Utilities ==========
 
 def normalize_label(lbl: str) -> str:
@@ -162,10 +166,12 @@ class FoxAssistant:
 
     # ===== Skills =====
 
-    def smalltalk(self, text: str, ctx: Dict[str, Any]) -> str:
-        if "witz" in (text or "").lower():
-            return "Treffen sich zwei Bytes. Sagt das eine: 'WLAN hier?' — 'Nee, nur LAN.'"
-        return "Alles gut! Was brauchst du?"
+    def gespraech(self, text: str, ctx: Dict[str, Any]) -> str:
+        t = (text or "").strip().lower()
+        # sehr einfacher Begrüßungs-/Konversations-Reply
+        if t in ("hallo", "hi", "hey", "servus", "moin", "grüezi") or any(g in t for g in ("hallo","hi","hey")):
+            return "Hi! Wie kann ich dir helfen?"
+        return "Alles klar. Erzähl mir einfach, was du brauchst."
 
     def mathe(self, text: str, ctx: Dict[str, Any]) -> str:
         res = try_auto_calc(text)
@@ -208,7 +214,7 @@ class FoxAssistant:
 
     def route(self, label: str, text: str, ctx: Dict[str, Any]) -> str:
         label = normalize_label(label)
-        if label == "smalltalk": return self.smalltalk(text, ctx)
+        if label == "gespräch":  return self.gespraech(text, ctx)
         if label == "time":      return self.time_now(text, ctx)
         if label == "geo":       return self.geo_info(text, ctx)
         if label == "wissen":    return self.wissen(text, ctx)
@@ -216,6 +222,48 @@ class FoxAssistant:
         if label == "mathe":     return self.mathe(text, ctx)
         if label == "termin":    return self.termin(text, ctx)
         return self.fallback(text, ctx)
+    
+    # ===== Best-Effort (Schnellantworten) =====
+    def _best_effort(self, text: str) -> tuple[str, str]:
+        t = (text or "").lower()
+
+        # gespräch/Begrüßung
+        greetings = ("hallo", "hi", "hey", "servus", "moin", "grüezi")
+        if any(g in t.split() for g in greetings) or t.strip() in greetings:
+            return ("Hi! Wie kann ich dir helfen?", "gespräch")
+
+        # Mathe
+        res = try_auto_calc(text)
+        if res is not None:
+            return (f"Das Ergebnis ist {round(res, 6)}.", "mathe")
+
+        # Wetter
+        if any(k in t for k in ("wetter", "regen", "heiss", "heiß", "kalt", "grad", "temperatur")):
+            q = extract_weather_query(text)
+            rep = get_weather(q or text)
+            return (rep, "wetter")
+
+        # Geo
+        try:
+            from fox.geo import resolve_place  # lazy import
+            place = resolve_place(text)
+        except Exception:
+            place = None
+        if place:
+            rep = geo_skill(text, {})
+            return (rep, "geo")
+
+        # Zeit/Datum
+        if any(k in t for k in ("uhr", "zeit", "datum", "tag", "heute", "morgen")):
+            return (time_skill(text, {}), "time")
+
+        # Termin-Indizien
+        if any(k in t for k in ("termin", "meeting", "arzt", "kalender")) or re.search(r"\d{1,2}[:.]\d{2}", t):
+            return (self.termin(text, {}), "termin")
+
+        # Fallback gespräch
+        return (self.gespraech(text, {}), "gespräch")
+
 
     # ===== Handle =====
 
@@ -240,12 +288,35 @@ class FoxAssistant:
         if label == "termin" and not (slots["when"] or slots["time"]):
             return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."
 
-        # 3) Fallback bei geringer Konfidenz
+         # 3) Bei geringer Konfidenz: probiere Best-Effort und lerne automatisch
         if conf < CONF_THRESHOLD:
-            reply = self.fallback(user, {"slots": slots, "memory": list(self.memory), "conf": conf})
-            self._memorize(user, reply, label=label, conf=conf)
-            return reply
+            best_reply, guess = self._best_effort(user)
 
+            # Auto-Learn Guardrails
+            can_autolearn = (
+                AUTO_LEARN and
+                len(user) <= AUTO_LEARN_MAX_LEN and
+                conf >= AUTO_LEARN_MIN_CONF and
+                guess in CLASSES
+            )
+
+            if can_autolearn:
+                try:
+                    # Speichere Trainingspaar + retrain
+                    self.learn_pair(user, guess)  # nutzt normalize_label + fit_fresh()
+                    best_reply += f"\n\n(Gelernt: '{user}' => {guess})"
+                except Exception as e:
+                    best_reply += f"\n\n(Autolernen fehlgeschlagen: {e})"
+            else:
+                # Wenn nicht auto-lernen, wenigstens Tipp anzeigen
+                best_reply += (
+                    f"\n\n(Tipp: Soll ich das als '{guess}' lernen? "
+                    f"Schreibe: learn: {user} => {guess})"
+                )
+
+            self._memorize(user, best_reply, label=guess, conf=conf, via="best-effort")
+            return best_reply
+        
         # 4) Normaler Skill-Rückweg
         reply = self.route(label, user, {"slots": slots, "memory": list(self.memory), "conf": conf})
         self._memorize(user, reply, label=label, conf=conf)
