@@ -32,5 +32,8 @@
     ```
 
  http://127.0.0.1:8010/chat
+
+um db zu installieren
+python geo_data.py 
  
     
