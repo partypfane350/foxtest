@@ -2,8 +2,8 @@ from __future__ import annotations
 import os, sys, time
 import requests
 
-from fox.speech_in import SpeechIn
-from fox.speech_out import Speech
+from fox.speech.speech_in import SpeechIn
+from fox.speech.speech_out import Speech
 
 USE_SERVER   = True
 SERVER_URL   = os.getenv("FOX_SERVER_URL", "http://127.0.0.1:8010/handle")

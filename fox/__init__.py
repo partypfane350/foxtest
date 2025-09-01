@@ -27,10 +27,10 @@ __all__ = [
 
 # --- Re-Exports (leichte Importe innerhalb des Pakets) ---
 from .labels import CLASSES, LABEL_TEXTS, LEGACY_MAP, WEEKDAYS
-from .speech_out import Speech
-from .speech_in import SpeechIn
-from .geo import geo_skill, resolve_place, search_places
-from .weather import get_weather
-from .time import time_skill
-from .mathe import mathe_skill, try_auto_calc
+from .speech.speech_out import Speech
+from .speech.speech_in import SpeechIn
+from .skills.geo_skill import geo_skill, resolve_place, search_places
+from .skills.weather_skill import get_weather
+from .skills.time_skill import time_skill
+from .skills.mathe_skill import mathe_skill, try_auto_calc
 from .knowledge import init_db as init_knowledge_db, set_fact, get_fact, search_facts
