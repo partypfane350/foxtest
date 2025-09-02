@@ -4,6 +4,7 @@ import os
 import re
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from collections import deque
@@ -14,7 +15,7 @@ import joblib
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier
 
-# ===== Skills zentral laden (inkl. Knowledge & Training) =====
+# ===== Skills zentral laden =====
 from fox.skills import (
     geo_skill,
     get_weather,
@@ -24,10 +25,10 @@ from fox.skills import (
     gespraech_skill,
     termin_skill,
     init_knowledge_db,
+    set_fact,
     get_fact,
     search_facts,
-    add_training_pair,
-    list_training,
+    # add_training_pair, list_training   # (optional – falls dein skills/__init__.py das schon exportiert)
 )
 
 # ===== Sprach Ein-/Ausgabe =====
@@ -75,7 +76,71 @@ for name in ("comtypes", "comtypes.client", "comtypes.gen", "pyttsx3"):
     lg.propagate = False
 
 
-# ========== Utilities ==========
+# ======================
+# Knowledge-DB (Training)
+# ======================
+def _knowledge_db_path() -> Path:
+    """
+    Bevorzugt knowledge.db im Projekt-Root.
+    Falls nicht vorhanden: fox/knowledge.db (ältere Struktur).
+    """
+    root = Path("knowledge.db")
+    if root.exists():
+        return root
+    fox_db = Path(__file__).resolve().parent / "fox" / "knowledge.db"
+    if fox_db.exists():
+        return fox_db
+    return root  # neu im Root anlegen
+
+def _open_knowledge():
+    p = _knowledge_db_path()
+    con = sqlite3.connect(p)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA temp_store=MEMORY;")
+    return con
+
+def _ensure_training_table():
+    try:
+        with _open_knowledge() as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS training(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text  TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    created_at REAL
+                )
+            """)
+            con.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_training_unique
+                ON training(text, label)
+            """)
+            con.commit()
+    except Exception as e:
+        log.warning("Konnte training-Tabelle nicht anlegen: %s", e)
+
+def db_add_training_pair(text: str, label: str) -> None:
+    text = (text or "").strip()
+    label = (label or "").strip()
+    if not text or not label:
+        return
+    _ensure_training_table()
+    with _open_knowledge() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO training(text,label,created_at) VALUES(?,?,?)",
+            (text, label, datetime.now().timestamp())
+        )
+        con.commit()
+
+def db_list_training() -> list[tuple[str, str]]:
+    _ensure_training_table()
+    with _open_knowledge() as con:
+        cur = con.execute("SELECT text, label FROM training ORDER BY id ASC")
+        return [(t, l) for (t, l) in cur.fetchall()]
+
+
+# ======================
+# Utils / Helfer
+# ======================
 def normalize_label(lbl: str) -> str:
     return LEGACY_MAP.get(lbl, lbl)
 
@@ -91,6 +156,17 @@ def extract_datetime(text: str) -> Dict[str, Optional[str]]:
     clock = f"{int(m.group(1)):02d}:{int(m.group(2)):02d}" if m else None
     return {"when": when, "time": clock}
 
+TIME_TRIGGERS    = ("uhr", "zeit", "datum", "tag", "heute", "morgen")
+WEATHER_TRIGGERS = ("wetter", "temperatur", "grad", "kalt", "heiss", "heiß", "regen", "sonnig", "sturm", "schnee")
+
+def has_time_trigger(s: str) -> bool:
+    s = (s or "").lower()
+    return any(k in s for k in TIME_TRIGGERS)
+
+def has_weather_trigger(s: str) -> bool:
+    s = (s or "").lower()
+    return any(k in s for k in WEATHER_TRIGGERS)
+
 def extract_weather_query(text: str) -> str:
     t = (text or "").strip()
     if not t:
@@ -105,9 +181,20 @@ def extract_weather_query(text: str) -> str:
     if re.search(rf"\b{TRIG}\b", t, re.IGNORECASE):
         tokens = re.findall(r"[A-Za-zÄÖÜäöüß\-’']+", t)
         if tokens:
-            cand = " ".join(tokens[-3:])
-            return cand.strip()
+            return " ".join(tokens[-3:]).strip()
     return t
+
+def format_topk(pairs: list[tuple[str, float]]) -> str:
+    return "   ".join(f"{i}) {lab} {round(p*100):d}%"
+                      for i, (lab, p) in enumerate(pairs, 1))
+
+def process_input(fox, speech: Speech, user_text: str) -> None:
+    user_text = (user_text or "").strip()
+    if not user_text:
+        return
+    reply = fox.handle(user_text)
+    print("Fox:", reply)
+    speech.say(reply)
 
 
 # ===========================
@@ -131,10 +218,7 @@ class IntentModel:
             alpha=1e-4,
         )
         clf.fit(X, labels_)
-        meta = {
-            "n_samples": len(texts),
-            "trained_at": datetime.now().isoformat(timespec="seconds"),
-        }
+        meta = {"n_samples": len(texts), "trained_at": datetime.now().isoformat(timespec="seconds")}
         return IntentModel(clf=clf, vectorizer=vec, meta=meta)
 
     def save(self, path: Path) -> None:
@@ -159,6 +243,7 @@ class FoxAssistant:
         self.memory = deque(maxlen=MEMORY_SIZE)
         self._load_training_from_db()
 
+        # Modell
         if MODEL_PATH.exists():
             self.model = IntentModel.load(MODEL_PATH)
             log.info("Modell geladen (%s).", MODEL_PATH)
@@ -171,10 +256,12 @@ class FoxAssistant:
         self.last_topk: List[tuple[str, float]] = []
         self._rebuild_train_matrix()
 
+        log.info("Knowledge-DB Pfad (Training): %s", _knowledge_db_path())
+
     # ===== Training laden =====
     def _load_training_from_db(self) -> None:
         """BASE_TRAIN + persistente Paare aus knowledge.db/training."""
-        persisted = list_training() or []        # [(text,label), ...]
+        persisted = db_list_training() or []   # [(text,label), ...]
         base_texts = list(BASE_TRAIN["texts"])
         base_labels = list(BASE_TRAIN["labels"])
         add_texts  = [t for (t, _) in persisted]
@@ -217,7 +304,7 @@ class FoxAssistant:
         except Exception:
             return (False, 0.0)
 
-    # ===== Routing-Wrapper (rufen NUR Skills auf) =====
+    # ===== Routing (Skills) =====
     def do_gespraech(self, text: str, ctx: Dict[str, Any]) -> str:
         return gespraech_skill(text, ctx)
 
@@ -285,7 +372,6 @@ class FoxAssistant:
 
     def do_wissen(self, text: str, ctx: Dict[str, Any]) -> str:
         q = (text or "").strip()
-
         try:
             val = get_fact(q) or get_fact(q.lower())
         except Exception:
@@ -331,7 +417,7 @@ class FoxAssistant:
         if label == "termin":    return self.do_termin(text, ctx)
         return self.fallback(text, ctx)
 
-    # ===== Top-K Vermutungen =====
+    # ===== Top-K =====
     def topk_predict(self, text: str, k: int = 3) -> List[tuple[str, float]]:
         X = self.model.vectorizer.transform([text])
         proba = self.model.clf.predict_proba(X)[0]
@@ -340,97 +426,124 @@ class FoxAssistant:
         pairs.sort(key=lambda x: x[1], reverse=True)
         return pairs[:k]
 
-    # ===== Best-Effort =====
-    def _best_effort(self, text: str) -> tuple[str, str]:
-        t = (text or "").lower()
-
-        if any(g in t.split() for g in ("hallo","hi","hey","servus","moin","grüezi")) or t.strip() in ("hallo","hi","hey","servus","moin","grüezi"):
-            return (gespraech_skill(text, {}), "gespräch")
-
-        res = try_auto_calc(text)
-        if res is not None:
-            return (f"Das Ergebnis ist {round(res, 6)}.", "mathe")
-
-        if any(k in t for k in ("wetter", "regen", "heiss", "heiß", "kalt", "grad", "temperatur")):
-            q = extract_weather_query(text)
-            rep = get_weather(q or text)
-            return (rep, "wetter")
-
-        rep_geo = geo_skill(text, {})
-        if rep_geo and "Sag mir einen Ort" not in rep_geo:
-            return (rep_geo, "geo")
-
-        if any(k in t for k in ("uhr", "zeit", "datum", "tag", "heute", "morgen")):
-            return (time_skill(text, {}), "time")
-
-        if any(k in t for k in ("termin", "meeting", "arzt", "kalender")) or re.search(r"\d{1,2}[:.]\d{2}", t):
-            return (self.do_termin(text, {}), "termin")
-
-        return (gespraech_skill(text, {}), "gespräch")
-
-    # ===== Handle =====
+    # ===== Handle (mit Disambiguation) =====
     def handle(self, user: str) -> str:
+        # 1) Sofort-Mathe
         auto = try_auto_calc(user)
         if auto is not None:
             reply = f"Das Ergebnis ist {round(auto, 6)}."
             self._memorize(user, reply, via="auto-mathe")
             return reply
 
-        X = self.model.vectorizer.transform([user])
+        t = (user or "").strip()
+
+        # 2) Modell
+        X = self.model.vectorizer.transform([t])
         proba = self.model.clf.predict_proba(X)[0]
         idx = int(proba.argmax())
         label = normalize_label(self.model.clf.classes_[idx])
         conf = float(proba[idx])
 
-        slots = extract_datetime(user)
-        self.last_input = user
+        slots = extract_datetime(t)
+
+        # Merken für "c 1" / "c wetter" / "why"
+        self.last_input = t
         try:
-            self.last_topk = self.topk_predict(user, k=3)
+            self.last_topk = self.topk_predict(t, k=3)
         except Exception:
             self.last_topk = []
 
-        known, max_sim = self.is_known_text(user)
+        # Bekannt?
+        known, max_sim = self.is_known_text(t)
 
-        exact_lbl = self.label_for_exact_text(user)
+        # Exakt gelernt?
+        exact_lbl = self.label_for_exact_text(t)
         if exact_lbl:
             label = normalize_label(exact_lbl)
             conf = max(conf, 0.999)
 
+        # Trigger-Overrides
+        if has_weather_trigger(t):
+            label = "wetter"; conf = max(conf, 0.66)
+        elif has_time_trigger(t):
+            label = "time"; conf = max(conf, 0.66)
+
+        # Termin braucht Slots
         if label == "termin" and not (slots["when"] or slots["time"]):
             return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."
 
+        # Direkt antworten
         if known or conf >= CONF_THRESHOLD:
-            reply = self.route(label, user, {"slots": slots, "memory": list(self.memory), "conf": conf})
-            self._memorize(user, reply, label=label, conf=conf, via=("direct" if known else "confident"))
-            return reply + (f"\n\n(Tipp: why zeigt meine Top-Vermutungen; correct: {label} lernt die Zuordnung.)" if SHOW_TIPS else "")
+            reply = self.route(label, t, {"slots": slots, "memory": list(self.memory), "conf": conf})
+            self._memorize(user, reply, label=label, conf=conf,
+                           via=("direct" if known else "confident"))
+            return reply
 
-        best_reply, guess = self._best_effort(user)
+        # Unsicher -> Best-Effort + Kurz-Hinweis + evtl. Autolernen
+        best_reply = None
+        try:
+            best_reply, guess = self._best_effort(t)
+        except Exception:
+            guess = label
+            best_reply = self.fallback(t, {"conf": conf})
+
         topk_pairs = self.last_topk or [(guess, conf)]
-        topk_str = ", ".join([f"{lab} ({p:.2f})" for lab, p in topk_pairs])
+        top_line = format_topk(topk_pairs)
 
+        # Autolernen (vorsichtig)
         can_autolearn = (
-            AUTO_LEARN and
-            len(user) <= AUTO_LEARN_MAX_LEN and
-            conf >= AUTO_LEARN_MIN_CONF and
-            guess in CLASSES and
-            guess not in AUTO_LEARN_BLACKLIST and
-            not re.search(r"https?://|\bwww\.", user)
+            AUTO_LEARN and len(t) <= AUTO_LEARN_MAX_LEN and conf >= AUTO_LEARN_MIN_CONF
+            and guess in CLASSES and guess not in AUTO_LEARN_BLACKLIST
+            and not re.search(r"https?://|\bwww\.", t)
         )
         if can_autolearn:
             try:
-                self.learn_pair(user, guess)
-                best_reply += f"\n\n(Gelernt: '{user}' => {guess})"
+                self.learn_pair(t, guess)   # persistiert in knowledge.db
+                best_reply += f"\n(Gelernt: '{t}' => {guess})"
             except Exception as e:
-                best_reply += f"\n\n(Autolernen fehlgeschlagen: {e})"
+                best_reply += f"\n(Autolernen fehlgeschlagen: {e})"
 
         hint = (
-            f"\n\nIch war mir unsicher (Top: {topk_str}; Ähnlichkeit={max_sim:.2f})."
-            f"\nKorrigieren: correct: {guess}   (oder: correct: <label>)"
-            f"\nBegründen: why"
+            f"\n\nUnsicher. Meintest du: {top_line}\n"
+            f"Sag: c 1  |  c 2  |  c 3  oder  c <label>  (z.B. c wetter)"
         )
         self._memorize(user, best_reply, label=guess, conf=conf, via="best-effort")
-        log.info("Neu & unsicher: conf=%.2f, max_sim=%.2f, guess=%s, top=%s", conf, max_sim, guess, topk_pairs)
         return best_reply + hint
+
+    # ===== Best-Effort =====
+    def _best_effort(self, text: str) -> tuple[str, str]:
+        t = (text or "").lower()
+
+        # Gespräch/Begrüßung
+        if any(g in t.split() for g in ("hallo","hi","hey","servus","moin","grüezi")) or t.strip() in ("hallo","hi","hey","servus","moin","grüezi"):
+            return (gespraech_skill(text, {}), "gespräch")
+
+        # Mathe
+        res = try_auto_calc(text)
+        if res is not None:
+            return (f"Das Ergebnis ist {round(res, 6)}.", "mathe")
+
+        # Wetter
+        if has_weather_trigger(t):
+            q = extract_weather_query(text)
+            rep = get_weather(q or text)
+            return (rep, "wetter")
+
+        # Geo
+        rep_geo = geo_skill(text, {})
+        if rep_geo and "Sag mir einen Ort" not in rep_geo:
+            return (rep_geo, "geo")
+
+        # Zeit/Datum
+        if has_time_trigger(t):
+            return (time_skill(text, {}), "time")
+
+        # Termin-Indizien
+        if any(k in t for k in ("termin", "meeting", "arzt", "kalender")) or re.search(r"\d{1,2}[:.]\d{2}", t):
+            return (self.do_termin(text, {}), "termin")
+
+        # Fallback Gespräch
+        return (gespraech_skill(text, {}), "gespräch")
 
     def _memorize(self, user: str, reply: str, **meta) -> None:
         self.memory.append({"user": user, "fox": reply, **meta})
@@ -440,7 +553,7 @@ class FoxAssistant:
         targets = [
             Path("fox_intent.pkl"),
             Path("calendar.json"),
-            Path("knowledge.db"),
+            _knowledge_db_path(),
         ]
         make_snapshot(targets, tag=tag)
 
@@ -457,11 +570,11 @@ class FoxAssistant:
 
         q = (question or "").strip()
         if not q:
-            raise ValueError("Leere Frage kann nicht gelernt werden.")
+            raise ValueError("Leere Eingabe kann nicht gelernt werden.")
 
         # In DB persistieren (dedupe via UNIQUE)
-        add_training_pair(q, label)
-        # Trainingsbasis komplett neu aus DB ziehen
+        db_add_training_pair(q, label)
+        # Trainingsbasis neu aus DB ziehen
         self._load_training_from_db()
         self.fit_fresh()
         self.save_all()
@@ -479,11 +592,12 @@ def main():
     print(labels.LABEL_TEXTS["cli"]["help"].rstrip())
     print(f"Labels geladen aus: {labels.__file__}")
 
-    # Knowledge-DB initialisieren
+    # Knowledge-DB (facts/notes) initialisieren
     try:
         init_knowledge_db()
     except Exception as e:
         print(f"Warnung: Konnte Knowledge-DB nicht initialisieren: {e}")
+    _ensure_training_table()
 
     fox = FoxAssistant()
     speech = Speech(enabled=True)
@@ -518,8 +632,7 @@ def main():
             heard = mic.listen_once(max_seconds=8)
             if heard:
                 print(f"Du (Mikro): {heard}")
-                reply = fox.handle(heard)
-                print("Fox:", reply); speech.say(reply)
+                process_input(fox, speech, heard)   # EINZIGER WEG
             else:
                 msg = "Ich habe nichts verstanden."
                 print("Fox:", msg); speech.say(msg)
@@ -564,43 +677,11 @@ def main():
             continue
 
         if l == "showtrain":
-            pairs = list_training() or []
+            pairs = db_list_training() or []
             print(json.dumps(
                 [{"text": t, "label": lab} for (t, lab) in pairs],
                 ensure_ascii=False, indent=2
             ))
-            continue
-
-        # --- Einzelnes Trainingspaar löschen ---
-        # deltrain: <text> => <label>
-        if l.startswith("deltrain:"):
-            try:
-                payload = user.split("deltrain:", 1)[1].strip()
-                q, lab = [p.strip() for p in payload.split("=>", 1)]
-                from fox.skills.knowledge import delete_training
-                removed = delete_training(q, lab)
-                print(f"Fox: Gelöscht: {removed} Eintrag(e) → '{q}' => {lab}")
-                # Modell neu aufbauen
-                fox._load_training_from_db()
-                fox.fit_fresh()
-                fox.save_all()
-            except Exception as e:
-                print(f"Fox: Nutzung: deltrain: <text> => <label>. Fehler: {e}")
-            continue
-
-        # --- Alle Trainingsdaten löschen (vorsichtig!) ---
-        if l == "cleartrain":
-            try:
-                from fox.skills.knowledge import _open
-                with _open() as con:
-                    con.execute("DELETE FROM training")
-                    con.commit()
-                print("Fox: Alle Trainingspaare gelöscht.")
-                fox._load_training_from_db()
-                fox.fit_fresh()
-                fox.save_all()
-            except Exception as e:
-                print(f"Fox: Konnte Training nicht leeren: {e}")
             continue
 
         if l == "classes":
@@ -613,13 +694,34 @@ def main():
                 if not pairs:
                     print("Fox: Keine Vorhersage verfügbar."); continue
                 pretty = "\n".join([f"- {lab:<10} {p:.2f}" for lab, p in pairs])
-                msg = f"Letzte Eingabe: {fox.last_input}\nTop-Vermutungen:\n{pretty}\n\nKorrigieren mit: correct: <label>"
+                msg = f"Letzte Eingabe: {fox.last_input}\nTop-Vermutungen:\n{pretty}\n\nKorrigieren: c 1 | c 2 | c 3 | c <label>"
                 print("Fox:", msg); speech.say("Okay.")
             else:
                 print("Fox: Ich habe noch keine letzte Eingabe gemerkt.")
             continue
 
-        # === Korrigieren & Lernen (persistiert jetzt in knowledge.db) ===
+        # === Kurzes Korrigieren: "c 1" | "c <label>" ===
+        if l.startswith("c "):
+            try:
+                if not fox.last_input:
+                    print("Fox: Keine letzte Eingabe vorhanden."); continue
+                arg = l.split("c", 1)[1].strip()
+                # Zahl 1..3 -> aus TopK
+                if arg.isdigit():
+                    i = int(arg)
+                    if i < 1 or i > 3 or not fox.last_topk or i > len(fox.last_topk):
+                        raise ValueError("Index außerhalb 1..3")
+                    chosen_label = fox.last_topk[i-1][0]
+                else:
+                    chosen_label = arg
+                fox.learn_pair(fox.last_input, chosen_label)
+                msg = f"Fox: Gespeichert → '{fox.last_input}' => {chosen_label}"
+                print(msg); speech.say("Gespeichert.")
+            except Exception as e:
+                print(f"Fox: Konnte nicht speichern: {e}")
+            continue
+
+        # === Langer Korrigieren-Weg bleibt kompatibel ===
         if l.startswith("correct:"):
             try:
                 payload = user.split("correct:", 1)[1].strip()
@@ -638,13 +740,13 @@ def main():
                 print(msg); speech.say("Fehler bei der Korrektur.")
             continue
 
-        # === Fakten speichern (jetzt in knowledge.db statt facts.json) ===
+        # === Fakten speichern (knowledge.db) ===
         if l.startswith("merke:"):
             try:
                 payload = user.split("merke:", 1)[1]
                 key, val = [p.strip() for p in payload.split("=", 1)]
                 norm_key = key.strip().lower()
-                get_fact(norm_key, val)
+                set_fact(norm_key, val)
                 print(f"Fox: Gemerkt – {norm_key} = {val}.")
                 speech.say("Okay, gemerkt.")
             except Exception:
@@ -652,10 +754,8 @@ def main():
                 print(msg); speech.say("Fehler bei 'merke'.")
             continue
 
-        # === Normaler Dialog ===
-        reply = fox.handle(user)
-        print("Fox:", reply)
-        speech.say(reply)
+        # === Normaler Dialog (Tastatur) ===
+        process_input(fox, speech, user)
 
 
 if __name__ == "__main__":

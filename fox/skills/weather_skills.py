@@ -1,52 +1,77 @@
-import os
-import requests
-from urllib.parse import quote_plus
+# fox/skills/weather_skills.py
+from __future__ import annotations
+import os, requests
+from typing import Optional
+from dotenv import load_dotenv
 
-API_KEY = os.getenv("OPENWEATHER_KEY", "").strip()  
-BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
+# .env sicher laden (auch falls main es später lädt)
+load_dotenv()
 
-def _clean(s: str) -> str:
-    return " ".join((s or "").strip().split())
-
-def get_weather(city_or_query: str) -> str:
+def _get_api_key() -> Optional[str]:
     """
-    Holt Wetter NUR, wenn man es explizit aufruft. Robust gegen Groß/Klein & Spaces.
-    Erwartet eine Stadt (am besten aus DB), probiert aber Varianten durch.
+    Holt den OpenWeather-Key aus der .env / Umgebung.
+    Unterstützt mehrere Namen inkl. Tippfehler.
     """
-    if not API_KEY:
-        return "Kein OPENWEATHER_KEY gesetzt (Umgebungsvariable)."
+    candidates = [
+        "OPENWEATHER_API_KEY",
+        "OPENWEATHER_KEY",
+        "OPENWEATHERMAP_API_KEY",
+        "OWM_KEY",
+        "OPENWEAHTER_KEY",   
+        "openweahter_key",  
+    ]
+    for name in candidates:
+        val = os.getenv(name)
+        if val:
+            return val.strip()
+    return None
 
-    q = _clean(city_or_query)
+def get_weather(place: str) -> str:
+    """
+    Holt aktuelles Wetter über OpenWeather (Current Weather Data).
+    Erwartet einen Ortsnamen wie 'Bern' oder 'Zürich'.
+    """
+    q = (place or "").strip()
     if not q:
-        return "Kein Ort angegeben."
+        return "Sag mir eine Stadt für Wetter (z. B. 'Wetter in Bern')."
 
-    tried = set()
-    candidates = [q, q.title()]
-    last = None
-    for cand in candidates:
-        if not cand or cand.lower() in tried:
-            continue
-        tried.add(cand.lower())
-        try:
-            url = f"{BASE_URL}?q={quote_plus(cand)}&appid={API_KEY}&units=metric&lang=de"
-            r = requests.get(url, timeout=7)
-            if r.status_code == 200:
-                data = r.json()
-                name = data.get("name", cand)
-                main = data.get("main", {})
-                wx   = (data.get("weather") or [{}])[0]
-                temp = main.get("temp")
-                desc = wx.get("description", "keine Beschreibung")
-                if temp is None:
-                    return f"Wetterdaten für {name} unvollständig."
-                return f"Wetter in {name}: {temp:.1f}°C, {desc}"
-            if r.status_code == 404:
-                continue  # nächste Variante probieren
-            try:
-                msg = r.json().get("message", "")
-            except Exception:
-                msg = ""
-            return f"Wetter-Fehler {r.status_code}: {msg or 'unbekannt'}"
-        except Exception as e:
-            last = f"Fehler beim Wetterabruf: {e}"
-    return last or f"Wetter für '{q}' nicht gefunden."
+    api_key = _get_api_key()
+    if not api_key:
+        return ("Kein OpenWeather-Key gefunden. Lege in deiner .env an z. B.:\n"
+                "OPENWEATHER_API_KEY=DEIN_KEY")
+
+    try:
+        url = "https://api.openweathermap.org/data/2.5/weather"
+        params = {"q": q, "appid": api_key, "units": "metric", "lang": "de"}
+        r = requests.get(url, params=params, timeout=6)
+        if r.status_code == 401:
+            return "OpenWeather-Key ist ungültig (401). Bitte Key in .env prüfen."
+        if r.status_code == 404:
+            return f"Ort nicht gefunden: {q}"
+        r.raise_for_status()
+        data = r.json()
+
+        name   = data.get("name") or q
+        sys    = data.get("sys") or {}
+        country= sys.get("country") or ""
+        main   = data.get("main") or {}
+        wx     = (data.get("weather") or [{}])[0]
+        wind   = data.get("wind") or {}
+
+        desc   = wx.get("description", "").capitalize()
+        temp   = main.get("temp")
+        feels  = main.get("feels_like")
+        hum    = main.get("humidity")
+        ws     = wind.get("speed")
+
+        parts = [f"Wetter für {name}: {desc}"]
+        if temp is not None:  parts.append(f"Temperatur {round(temp)}°C")
+        if hum  is not None:  parts.append(f"Luftfeuchtigkeit {hum}%")
+        if ws   is not None:  parts.append(f"Windstärke etwa {round(ws)} meter pro sekunde")
+
+        return " | ".join(parts)
+
+    except requests.Timeout:
+        return "OpenWeather: Zeitüberschreitung. Versuch es gleich nochmal."
+    except Exception as e:
+        return f"OpenWeather-Fehler: {e}"
