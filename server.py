@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 # === Knowledge DB ===
-from fox.knowledge import init_db, set_fact, get_fact, search_facts
+from fox.skills.knowledge import init_db, set_fact, get_fact, search_facts
 init_db()
 
 # Deine Fox-Logik wiederverwenden

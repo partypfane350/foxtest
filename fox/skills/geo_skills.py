@@ -12,7 +12,7 @@ import re
 #     latitude REAL, longitude REAL, feature_class TEXT, feature_code TEXT, ...
 #   )
 #   iso2(code TEXT PRIMARY KEY, name TEXT)
-DB_PATH = (Path(__file__).resolve().parents[1] / "geo_data" / "geo.db").as_posix()
+DB_PATH = (Path(__file__).resolve().parents[2] / "geo_data" / "geo.db").as_posix()
 
 # Fallback ISO2->Name (nur wenn iso2-Tabelle fehlt/leer ist)
 ISO2_FALLBACK = {

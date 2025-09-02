@@ -14,60 +14,57 @@ import joblib
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier
 
-# === Skills/Module ===
-from fox.skills.geo_skill import geo_skill
-from fox.skills.weather_skill import get_weather
-from fox.skills.mathe_skill import try_auto_calc, mathe_skill as mathe_skill_lib
-from fox.skills.time_skill import time_skill
+# ===== Skills zentral laden (inkl. Knowledge & Training) =====
+from fox.skills import (
+    geo_skill,
+    get_weather,
+    mathe_skill,
+    try_auto_calc,
+    time_skill,
+    gespraech_skill,
+    termin_skill,
+    init_knowledge_db,
+    get_fact,
+    search_facts,
+    add_training_pair,
+    list_training,
+)
 
-# ==== sprach Ein-/Ausgabe ====
-from fox.speech.speech_in import SpeechIn           
+# ===== Sprach Ein-/Ausgabe =====
+from fox.speech import SpeechIn, Speech
 import sounddevice as sd
-from fox.speech.speech_out import Speech
 
-# === Labels auslagern ===
+# ===== Labels (Aggregat) =====
 import fox.labels as labels
 from fox.labels import CLASSES, LEGACY_MAP, WEEKDAYS, BASE_TRAIN
 
-# === Snapshots (Backups) aus Projekt-Root ===
+# ===== Snapshots =====
 from backup import make_snapshot
 
 from dotenv import load_dotenv
-
-# Knowledge-DB/Facts (optional)
-try:
-    from fox import get_fact, search_facts, init_knowledge_db  
-except Exception:
-    get_fact = None
-    search_facts = None
-    init_knowledge_db = None
-
 load_dotenv()
 
 # =========================
 # Konfiguration & Konstanten
 # =========================
 MODEL_PATH       = Path("fox_intent.pkl")
-TRAIN_PATH       = Path("train_data.json")
-FACTS_PATH       = Path("facts.json")
 CALENDAR_PATH    = Path("calendar.json")
 
-CONF_THRESHOLD   = 0.60   # Mindest-Konfidenz fürs Modell-Routing
-SIM_THRESHOLD    = 0.72   # ab dieser TF-IDF-Ähnlichkeit gilt Text als bekannt
-MEMORY_SIZE      = 200    # Verlaufsspeicher
-RANDOM_STATE     = 42     # Reproduzierbarkeit
+CONF_THRESHOLD   = 0.60
+SIM_THRESHOLD    = 0.72
+MEMORY_SIZE      = 200
+RANDOM_STATE     = 42
 SGD_MAX_ITER     = 1000
 SGD_TOL          = 1e-3
 
-AUTO_LEARN            = True   # Auto-Lernen aktivieren
-AUTO_LEARN_MIN_CONF   = 0.15   # nur lernen, wenn das Modell überhaupt etwas signalisiert
-AUTO_LEARN_MAX_LEN    = 120    # keine zu langen Sätze automatisch lernen
-AUTO_LEARN_BLACKLIST  = {}     # diese Labels nicht automatisch lernen
+AUTO_LEARN            = True
+AUTO_LEARN_MIN_CONF   = 0.15
+AUTO_LEARN_MAX_LEN    = 120
+AUTO_LEARN_BLACKLIST  = {}
 
-SHOW_TIPS       = False        # Tipp-Zeile am Ende der Antwort anzeigen?
-WIKI_TIMEOUT    = 5            # Sekunden für Wikipedia-Requests
+SHOW_TIPS       = False
+WIKI_TIMEOUT    = 5
 
-# Logging-Level aus .env steuerbar (FOX_LOG_LEVEL=DEBUG/INFO/WARNING/ERROR)
 LOG_LEVEL = os.getenv("FOX_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s | %(levelname)s | %(message)s")
@@ -82,24 +79,6 @@ for name in ("comtypes", "comtypes.client", "comtypes.gen", "pyttsx3"):
 def normalize_label(lbl: str) -> str:
     return LEGACY_MAP.get(lbl, lbl)
 
-def load_json(path: Path, default):
-    if not path.exists():
-        return default
-    # Robust gegen UTF-8-BOM/kaputte Dateien
-    for enc in ("utf-8", "utf-8-sig"):
-        try:
-            with path.open("r", encoding=enc) as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            continue
-        except Exception:
-            continue
-    return default
-
-def save_json(path: Path, data) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
 def extract_datetime(text: str) -> Dict[str, Optional[str]]:
     t = (text or "").lower()
     when = "heute" if "heute" in t else ("morgen" if "morgen" in t else None)
@@ -113,29 +92,21 @@ def extract_datetime(text: str) -> Dict[str, Optional[str]]:
     return {"when": when, "time": clock}
 
 def extract_weather_query(text: str) -> str:
-    """
-    Robust: erkennt z. B. "wetter in rio de janeiro", "wie heiss ist es in new york",
-    "regen morgen in basel", "wetter von bern", "temperatur für berlin".
-    """
     t = (text or "").strip()
     if not t:
         return ""
-    # 1) Präposition + mehrwortiger Ort bis Satzende
     m = re.search(r"\b(?:in|von|für|bei)\s+([A-Za-zÄÖÜäöüß\-’' ]{2,})$", t, re.IGNORECASE)
     if m:
         return m.group(1).strip()
-    # 2) Trigger + danach der Rest
     TRIG = r"(?:wetter|temperatur|grad|kalt|heiß|heiss|regen|sonnig|sturm|schnee)"
     m2 = re.search(rf"\b{TRIG}\b\s+([A-Za-zÄÖÜäöüß\-’' ]{{2,}})$", t, re.IGNORECASE)
     if m2:
         return m2.group(1).strip()
-    # 3) Trigger vorhanden -> letzte 1-3 Tokens als Ort versuchen
     if re.search(rf"\b{TRIG}\b", t, re.IGNORECASE):
         tokens = re.findall(r"[A-Za-zÄÖÜäöüß\-’']+", t)
         if tokens:
             cand = " ".join(tokens[-3:])
             return cand.strip()
-    # 4) sonst Original
     return t
 
 
@@ -150,12 +121,7 @@ class IntentModel:
 
     @staticmethod
     def fit_from_texts(texts: List[str], labels_: List[str]) -> "IntentModel":
-        vec = TfidfVectorizer(
-            ngram_range=(1, 2),
-            lowercase=True,
-            strip_accents=None,
-            min_df=1,
-        )
+        vec = TfidfVectorizer(ngram_range=(1, 2), lowercase=True, strip_accents=None, min_df=1)
         X = vec.fit_transform(texts)
         clf = SGDClassifier(
             loss="log_loss",
@@ -191,20 +157,8 @@ class IntentModel:
 class FoxAssistant:
     def __init__(self):
         self.memory = deque(maxlen=MEMORY_SIZE)
+        self._load_training_from_db()
 
-        # Trainingsdaten laden/mergen
-        persisted = load_json(TRAIN_PATH, {"texts": [], "labels": []})
-        self.train_texts: List[str] = list(BASE_TRAIN["texts"]) + list(persisted.get("texts", []))
-        self.train_labels: List[str] = list(BASE_TRAIN["labels"]) + list(persisted.get("labels", []))
-
-        # Dedupe: (text,label)-Paare einmalig
-        pairs: List[Tuple[str, str]] = list(dict.fromkeys(zip(self.train_texts, self.train_labels)))
-        self.train_texts, self.train_labels = map(list, zip(*pairs)) if pairs else ([], [])
-
-        # Legacy-Labels normalisieren
-        self.train_labels = [normalize_label(x) for x in self.train_labels]
-
-        # Modell bauen/laden
         if MODEL_PATH.exists():
             self.model = IntentModel.load(MODEL_PATH)
             log.info("Modell geladen (%s).", MODEL_PATH)
@@ -213,26 +167,34 @@ class FoxAssistant:
             self.model.save(MODEL_PATH)
             log.info("Modell neu trainiert (%d Samples).", len(self.train_texts))
 
-        # Merker für Korrektur/Analyse
         self.last_input: Optional[str] = None
         self.last_topk: List[tuple[str, float]] = []
-
-        # Train-Matrix für Ähnlichkeitscheck bauen
         self._rebuild_train_matrix()
+
+    # ===== Training laden =====
+    def _load_training_from_db(self) -> None:
+        """BASE_TRAIN + persistente Paare aus knowledge.db/training."""
+        persisted = list_training() or []        # [(text,label), ...]
+        base_texts = list(BASE_TRAIN["texts"])
+        base_labels = list(BASE_TRAIN["labels"])
+        add_texts  = [t for (t, _) in persisted]
+        add_labels = [l for (_, l) in persisted]
+        texts = base_texts + add_texts
+        labels_ = base_labels + add_labels
+        # dedupe (text,label)
+        pairs = list(dict.fromkeys(zip(texts, labels_)))
+        self.train_texts, self.train_labels = map(list, zip(*pairs)) if pairs else ([], [])
 
     # ===== Index/Ähnlichkeit =====
     def _rebuild_train_matrix(self) -> None:
-        """Baue die TF-IDF-Matrix der Trainingssätze (für Ähnlichkeitscheck) neu."""
         try:
             self.train_X = self.model.vectorizer.transform(self.train_texts)
         except Exception:
             from scipy.sparse import csr_matrix
             self.train_X = csr_matrix((0, 0))
-        # Exact-Match-Set
         self._train_texts_lc = set((t or "").strip().lower() for t in self.train_texts)
 
     def label_for_exact_text(self, text: str) -> Optional[str]:
-        """Falls der Text exakt im Training vorkommt, gib das dazu gespeicherte Label zurück."""
         t = (text or "").strip().lower()
         for tt, ll in zip(self.train_texts, self.train_labels):
             if (tt or "").strip().lower() == t:
@@ -240,22 +202,13 @@ class FoxAssistant:
         return None
 
     def is_known_text(self, text: str) -> tuple[bool, float]:
-        """
-        Prüft, ob der Text 'bekannt' ist:
-        - exact match im Training ODER
-        - maximale Cosine-Ähnlichkeit >= SIM_THRESHOLD
-        """
         t = (text or "").strip()
         if not t:
             return (False, 0.0)
-
-        # Exact Match
         if t.lower() in self._train_texts_lc:
             return (True, 1.0)
-
-        # Cosine-Ähnlichkeit (TF-IDF ist L2-normalisiert -> dot = cosine)
         try:
-            x = self.model.vectorizer.transform([t])          # (1, V)
+            x = self.model.vectorizer.transform([t])
             if getattr(self, "train_X", None) is None or self.train_X.shape[0] == 0:
                 return (False, 0.0)
             sims = (self.train_X @ x.T).toarray().ravel()
@@ -264,29 +217,25 @@ class FoxAssistant:
         except Exception:
             return (False, 0.0)
 
-    # ===== Skills =====
-    def gespraech(self, text: str, ctx: Dict[str, Any]) -> str:
-        t = (text or "").strip().lower()
-        if t in ("hallo", "hi", "hey", "servus", "moin", "grüezi") or any(g in t for g in ("hallo","hi","hey")):
-            return "Hi! Wie kann ich dir helfen?"
-        return "Alles klar. Erzähl mir einfach, was du brauchst."
+    # ===== Routing-Wrapper (rufen NUR Skills auf) =====
+    def do_gespraech(self, text: str, ctx: Dict[str, Any]) -> str:
+        return gespraech_skill(text, ctx)
 
-    def mathe(self, text: str, ctx: Dict[str, Any]) -> str:
+    def do_mathe(self, text: str, ctx: Dict[str, Any]) -> str:
         res = try_auto_calc(text)
         if res is not None:
             return f"Ergebnis: {res}"
-        return mathe_skill_lib(text, ctx)
+        return mathe_skill(text, ctx)
 
-    def geo_info(self, text: str, ctx: Dict[str, Any]) -> str:
+    def do_geo(self, text: str, ctx: Dict[str, Any]) -> str:
         return geo_skill(text, ctx)
 
-    def wetter(self, text: str, ctx: Dict[str, Any]) -> str:
+    def do_wetter(self, text: str, ctx: Dict[str, Any]) -> str:
         q = extract_weather_query(text)
         if not q:
             return "Sag mir eine Stadt für Wetter (z. B. 'Wetter in Bern')."
         return get_weather(q)
 
-    # ==== Wissen: selbst Antwort suchen (facts / knowledge / wikipedia) ====
     def _wiki_summary(self, query: str, lang: str = "de") -> Optional[str]:
         import requests
         try:
@@ -302,7 +251,6 @@ class FoxAssistant:
             title = hits[0].get("title")
             if not title:
                 return None
-
             r2 = requests.get(f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{title}", timeout=WIKI_TIMEOUT)
             js = r2.json()
             summ = js.get("extract") or js.get("description")
@@ -316,12 +264,6 @@ class FoxAssistant:
             return None
 
     def _search_facts_best(self, q: str) -> Optional[tuple[str, str, float]]:
-        """
-        Einfache Approx-Suche über knowledge.facts (Token-Overlap).
-        Gibt (key, value, score 0..1) zurück.
-        """
-        if search_facts is None:
-            return None
         try:
             rows = search_facts(q)  # [(key, value), ...]
         except Exception:
@@ -341,43 +283,34 @@ class FoxAssistant:
         scored.sort(key=lambda x: x[2], reverse=True)
         return scored[0] if scored else None
 
-    def wissen(self, text: str, ctx: Dict[str, Any]) -> str:
+    def do_wissen(self, text: str, ctx: Dict[str, Any]) -> str:
         q = (text or "").strip()
 
-        # 1) exakte Facts in facts.json (per CLI "merke: key = val")
-        if get_fact is not None:
-            try:
-                val = get_fact(q) or get_fact(q.lower())
-            except Exception:
-                val = None
-            if val:
-                return str(val)
+        try:
+            val = get_fact(q) or get_fact(q.lower())
+        except Exception:
+            val = None
+        if val:
+            return str(val)
 
-        # 2) approximate Facts aus knowledge.db (search_facts)
         hit = self._search_facts_best(q)
         if hit and hit[2] >= 0.25:
-            key, val, score = hit
-            return f"{val}  (aus Wissen: {key}, match={score:.2f})"
+            key, val2, score = hit
+            return f"{val2}  (aus Wissen: {key}, match={score:.2f})"
 
-        # 3) Wikipedia (optional)
         ans = self._wiki_summary(q, lang="de")
         if ans:
             return ans + "\n\n(Hinweis: Quelle Wikipedia-Kurzfassung)"
 
-        # 4) nichts gefunden
         return "Dazu kenne ich noch keine gute Antwort. Sag mir kurz die richtige – ich lerne es."
 
-    def termin(self, text: str, ctx: Dict[str, Any]) -> str:
+    def do_termin(self, text: str, ctx: Dict[str, Any]) -> str:
         dt = extract_datetime(text)
-        if not dt["when"] and not dt["time"]:
+        if not (dt["when"] or dt["time"]):
             return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."
-        evts = load_json(CALENDAR_PATH, [])
-        evts.append({"text": text, "when": dt["when"], "time": dt["time"]})
-        save_json(CALENDAR_PATH, evts)
-        pieces = [p for p in [dt["when"], dt["time"]] if p]
-        return f"Okay, Termin gespeichert: {' '.join(pieces)}".strip()
+        return termin_skill(text, ctx)
 
-    def time_now(self, text: str, ctx: Dict[str, Any]) -> str:
+    def do_time(self, text: str, ctx: Dict[str, Any]) -> str:
         return time_skill(text, ctx)
 
     def fallback(self, text: str, ctx: Dict[str, Any]) -> str:
@@ -389,13 +322,13 @@ class FoxAssistant:
     # ===== Routing =====
     def route(self, label: str, text: str, ctx: Dict[str, Any]) -> str:
         label = normalize_label(label)
-        if label == "gespräch":  return self.gespraech(text, ctx)
-        if label == "time":      return self.time_now(text, ctx)
-        if label == "geo":       return self.geo_info(text, ctx)
-        if label == "wissen":    return self.wissen(text, ctx)
-        if label == "wetter":    return self.wetter(text, ctx)
-        if label == "mathe":     return self.mathe(text, ctx)
-        if label == "termin":    return self.termin(text, ctx)
+        if label == "gespräch":  return self.do_gespraech(text, ctx)
+        if label == "time":      return self.do_time(text, ctx)
+        if label == "geo":       return self.do_geo(text, ctx)
+        if label == "wissen":    return self.do_wissen(text, ctx)
+        if label == "wetter":    return self.do_wetter(text, ctx)
+        if label == "mathe":     return self.do_mathe(text, ctx)
+        if label == "termin":    return self.do_termin(text, ctx)
         return self.fallback(text, ctx)
 
     # ===== Top-K Vermutungen =====
@@ -407,57 +340,42 @@ class FoxAssistant:
         pairs.sort(key=lambda x: x[1], reverse=True)
         return pairs[:k]
 
-    # ===== Best-Effort (Schnellantworten) =====
+    # ===== Best-Effort =====
     def _best_effort(self, text: str) -> tuple[str, str]:
         t = (text or "").lower()
 
-        # gespräch/Begrüßung
-        greetings = ("hallo", "hi", "hey", "servus", "moin", "grüezi")
-        if any(g in t.split() for g in greetings) or t.strip() in greetings:
-            return ("Hi! Wie kann ich dir helfen?", "gespräch")
+        if any(g in t.split() for g in ("hallo","hi","hey","servus","moin","grüezi")) or t.strip() in ("hallo","hi","hey","servus","moin","grüezi"):
+            return (gespraech_skill(text, {}), "gespräch")
 
-        # Mathe
         res = try_auto_calc(text)
         if res is not None:
             return (f"Das Ergebnis ist {round(res, 6)}.", "mathe")
 
-        # Wetter
         if any(k in t for k in ("wetter", "regen", "heiss", "heiß", "kalt", "grad", "temperatur")):
             q = extract_weather_query(text)
             rep = get_weather(q or text)
             return (rep, "wetter")
 
-        # Geo
-        try:
-            from fox.skills.geo_skill import resolve_place  # lazy import
-            place = resolve_place(text)
-        except Exception:
-            place = None
-        if place:
-            rep = geo_skill(text, {})
-            return (rep, "geo")
+        rep_geo = geo_skill(text, {})
+        if rep_geo and "Sag mir einen Ort" not in rep_geo:
+            return (rep_geo, "geo")
 
-        # Zeit/Datum
         if any(k in t for k in ("uhr", "zeit", "datum", "tag", "heute", "morgen")):
             return (time_skill(text, {}), "time")
 
-        # Termin-Indizien
         if any(k in t for k in ("termin", "meeting", "arzt", "kalender")) or re.search(r"\d{1,2}[:.]\d{2}", t):
-            return (self.termin(text, {}), "termin")
+            return (self.do_termin(text, {}), "termin")
 
-        # Fallback gespräch
-        return (self.gespraech(text, {}), "gespräch")
+        return (gespraech_skill(text, {}), "gespräch")
 
     # ===== Handle =====
     def handle(self, user: str) -> str:
-        # 1) Sofort-Mathe
         auto = try_auto_calc(user)
         if auto is not None:
             reply = f"Das Ergebnis ist {round(auto, 6)}."
             self._memorize(user, reply, via="auto-mathe")
             return reply
 
-        # 2) Intent
         X = self.model.vectorizer.transform([user])
         proba = self.model.clf.predict_proba(X)[0]
         idx = int(proba.argmax())
@@ -465,36 +383,27 @@ class FoxAssistant:
         conf = float(proba[idx])
 
         slots = extract_datetime(user)
-
-        # Merken für 'correct:' und 'why'
         self.last_input = user
         try:
             self.last_topk = self.topk_predict(user, k=3)
         except Exception:
             self.last_topk = []
 
-        # Prüfen, ob 'bekannt' (Exact-Match oder hohe Ähnlichkeit)
         known, max_sim = self.is_known_text(user)
 
-        # Falls exakter Trainingssatz existiert, Label erzwingen
         exact_lbl = self.label_for_exact_text(user)
         if exact_lbl:
             label = normalize_label(exact_lbl)
             conf = max(conf, 0.999)
 
-        # Termin braucht Slots
         if label == "termin" and not (slots["when"] or slots["time"]):
             return "Für den Termin brauche ich Datum/Zeit (z. B. 'morgen 15:00')."
 
-        # 3) Routing-Entscheidung:
-        #    Bekannt ODER konfident -> direkt antworten
         if known or conf >= CONF_THRESHOLD:
             reply = self.route(label, user, {"slots": slots, "memory": list(self.memory), "conf": conf})
-            self._memorize(user, reply, label=label, conf=conf,
-                           via=("direct" if known else "confident"))
+            self._memorize(user, reply, label=label, conf=conf, via=("direct" if known else "confident"))
             return reply + (f"\n\n(Tipp: why zeigt meine Top-Vermutungen; correct: {label} lernt die Zuordnung.)" if SHOW_TIPS else "")
 
-        # 4) Neu & unsicher -> Best-Effort + Lernhinweise
         best_reply, guess = self._best_effort(user)
         topk_pairs = self.last_topk or [(guess, conf)]
         topk_str = ", ".join([f"{lab} ({p:.2f})" for lab, p in topk_pairs])
@@ -530,10 +439,8 @@ class FoxAssistant:
     def snapshot(self, tag: str = "autosave") -> None:
         targets = [
             Path("fox_intent.pkl"),
-            Path("train_data.json"),
-            Path("facts.json"),
             Path("calendar.json"),
-            Path("knowledge.db"),  # falls vorhanden
+            Path("knowledge.db"),
         ]
         make_snapshot(targets, tag=tag)
 
@@ -544,7 +451,6 @@ class FoxAssistant:
         log.info("Neu trainiert (%d Samples).", len(self.train_texts))
 
     def learn_pair(self, question: str, label: str) -> None:
-        # Dedupe + Guards
         label = normalize_label(label)
         if label not in CLASSES:
             raise ValueError(f"Unbekanntes Label '{label}'. Erlaubt: {', '.join(CLASSES)}")
@@ -553,23 +459,18 @@ class FoxAssistant:
         if not q:
             raise ValueError("Leere Frage kann nicht gelernt werden.")
 
-        # identisches Paar schon vorhanden?
-        if any(t == q and l == label for t, l in zip(self.train_texts, self.train_labels)):
-            return  # schon gelernt
-
-        self.train_texts.append(q)
-        self.train_labels.append(label)
-        save_json(TRAIN_PATH, {"texts": self.train_texts, "labels": self.train_labels})
+        # In DB persistieren (dedupe via UNIQUE)
+        add_training_pair(q, label)
+        # Trainingsbasis komplett neu aus DB ziehen
+        self._load_training_from_db()
         self.fit_fresh()
         self.save_all()
         self.snapshot(tag="learn")
 
     def save_all(self) -> None:
         self.model.save(MODEL_PATH)
-        save_json(TRAIN_PATH, {"texts": self.train_texts, "labels": self.train_labels})
-        # Matrix aktuell halten
         self._rebuild_train_matrix()
-        log.info("Modell & Trainingsdaten gespeichert.")
+        log.info("Modell gespeichert & Index aktualisiert.")
 
 
 # ========= CLI-Loop =========
@@ -578,12 +479,11 @@ def main():
     print(labels.LABEL_TEXTS["cli"]["help"].rstrip())
     print(f"Labels geladen aus: {labels.__file__}")
 
-    # Knowledge-DB initialisieren (falls verfügbar)
-    if init_knowledge_db:
-        try:
-            init_knowledge_db()
-        except Exception as e:
-            print(f"Warnung: Konnte Knowledge-DB nicht initialisieren: {e}")
+    # Knowledge-DB initialisieren
+    try:
+        init_knowledge_db()
+    except Exception as e:
+        print(f"Warnung: Konnte Knowledge-DB nicht initialisieren: {e}")
 
     fox = FoxAssistant()
     speech = Speech(enabled=True)
@@ -604,20 +504,15 @@ def main():
             print("Bis bald!")
             break
 
-        # === Audio-Steuerung (ein/aus) ===
+        # === Audio-Steuerung ===
         if l == "audio an":
-            speech.set_enabled(True)
-            print("Fox: Audio EIN")
-            continue
+            speech.set_enabled(True); print("Fox: Audio EIN"); continue
         if l == "audio aus":
-            speech.set_enabled(False)
-            print("Fox: Audio AUS")
-            continue
+            speech.set_enabled(False); print("Fox: Audio AUS"); continue
 
-        # === Mikro-Geräte anzeigen/wechseln (Whisper) ===
+        # === Mikro-Geräte ===
         if l in ("mikro geraete", "mikro geräte", "mikro devices"):
-            SpeechIn.list_input_devices()
-            continue
+            SpeechIn.list_input_devices(); continue
 
         if l == "mikro":
             heard = mic.listen_once(max_seconds=8)
@@ -638,16 +533,16 @@ def main():
                     raise ValueError(f"Index {idx} außerhalb (0..{len(devs)-1})")
                 if devs[idx].get("max_input_channels", 0) <= 0:
                     raise ValueError(f"Gerät {idx} hat keine Eingabekanäle")
-                sd.default.device = (idx, None)  # nur Input wechseln
+                sd.default.device = (idx, None)
                 print(f"Fox: Mikrofon-Eingabegerät auf Index {idx} gesetzt.")
             except Exception as e:
                 print(f"Fox: Konnte Gerät nicht setzen: {e}")
             continue
 
-        # === Utility-Befehle ===
+        # === Utility ===
         if l == "save":
             fox.save_all()
-            print(f"Fox: Modell + Trainingsdaten gespeichert → {MODEL_PATH}")
+            print(f"Fox: Modell gespeichert → {MODEL_PATH}")
             continue
 
         if l == "backup":
@@ -656,8 +551,7 @@ def main():
             continue
 
         if l == "reload":
-            fox.model = IntentModel.load(MODEL_PATH)
-            fox._rebuild_train_matrix()
+            fox.model = IntentModel.load(MODEL_PATH); fox._rebuild_train_matrix()
             print("Fox: Modell neu geladen.")
             continue
 
@@ -670,23 +564,54 @@ def main():
             continue
 
         if l == "showtrain":
+            pairs = list_training() or []
             print(json.dumps(
-                {"texts": fox.train_texts, "labels": fox.train_labels},
+                [{"text": t, "label": lab} for (t, lab) in pairs],
                 ensure_ascii=False, indent=2
             ))
             continue
 
-        if l == "classes":
-            print("Klassen:", ", ".join(CLASSES))
+        # --- Einzelnes Trainingspaar löschen ---
+        # deltrain: <text> => <label>
+        if l.startswith("deltrain:"):
+            try:
+                payload = user.split("deltrain:", 1)[1].strip()
+                q, lab = [p.strip() for p in payload.split("=>", 1)]
+                from fox.skills.knowledge import delete_training
+                removed = delete_training(q, lab)
+                print(f"Fox: Gelöscht: {removed} Eintrag(e) → '{q}' => {lab}")
+                # Modell neu aufbauen
+                fox._load_training_from_db()
+                fox.fit_fresh()
+                fox.save_all()
+            except Exception as e:
+                print(f"Fox: Nutzung: deltrain: <text> => <label>. Fehler: {e}")
             continue
 
-        # === Analyse: warum? (Top-3) ===
+        # --- Alle Trainingsdaten löschen (vorsichtig!) ---
+        if l == "cleartrain":
+            try:
+                from fox.skills.knowledge import _open
+                with _open() as con:
+                    con.execute("DELETE FROM training")
+                    con.commit()
+                print("Fox: Alle Trainingspaare gelöscht.")
+                fox._load_training_from_db()
+                fox.fit_fresh()
+                fox.save_all()
+            except Exception as e:
+                print(f"Fox: Konnte Training nicht leeren: {e}")
+            continue
+
+        if l == "classes":
+            print("Klassen:", ", ".join(CLASSES)); continue
+
+        # === Analyse: warum? ===
         if l == "why":
             if fox.last_input:
                 pairs = fox.last_topk or fox.topk_predict(fox.last_input, 3)
                 if not pairs:
-                    print("Fox: Keine Vorhersage verfügbar.")
-                    continue
+                    print("Fox: Keine Vorhersage verfügbar."); continue
                 pretty = "\n".join([f"- {lab:<10} {p:.2f}" for lab, p in pairs])
                 msg = f"Letzte Eingabe: {fox.last_input}\nTop-Vermutungen:\n{pretty}\n\nKorrigieren mit: correct: <label>"
                 print("Fox:", msg); speech.say("Okay.")
@@ -694,10 +619,7 @@ def main():
                 print("Fox: Ich habe noch keine letzte Eingabe gemerkt.")
             continue
 
-        # === Korrigieren & Lernen ===
-        # Varianten:
-        # 1) correct: <label>            -> lernt (letzte Eingabe) => <label>
-        # 2) correct: <text> => <label>  -> lernt (<text>) => <label>
+        # === Korrigieren & Lernen (persistiert jetzt in knowledge.db) ===
         if l.startswith("correct:"):
             try:
                 payload = user.split("correct:", 1)[1].strip()
@@ -716,21 +638,15 @@ def main():
                 print(msg); speech.say("Fehler bei der Korrektur.")
             continue
 
-        # === Fakten kurz speichern ===
-        # merke: <frage> = <antwort>
+        # === Fakten speichern (jetzt in knowledge.db statt facts.json) ===
         if l.startswith("merke:"):
             try:
                 payload = user.split("merke:", 1)[1]
                 key, val = [p.strip() for p in payload.split("=", 1)]
                 norm_key = key.strip().lower()
-                facts = load_json(FACTS_PATH, {})
-                if facts.get(norm_key) == val:
-                    msg = f"Fox: War schon gemerkt – {norm_key} = {val}."
-                else:
-                    facts[norm_key] = val
-                    save_json(FACTS_PATH, facts)
-                    msg = f"Fox: Gemerkt – {norm_key} = {val}. ({len(facts)} Einträge)"
-                print(msg); speech.say("Okay, gemerkt.")
+                get_fact(norm_key, val)
+                print(f"Fox: Gemerkt – {norm_key} = {val}.")
+                speech.say("Okay, gemerkt.")
             except Exception:
                 msg = "Fox: Nutzung: merke: <frage> = <antwort>"
                 print(msg); speech.say("Fehler bei 'merke'.")
