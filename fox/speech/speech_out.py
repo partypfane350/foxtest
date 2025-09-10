@@ -10,7 +10,7 @@ class Speech:
         self.engine = pyttsx3.init()
 
         # ==== Standard-Einstellungen ====
-        self._select_voice("stefan")      
+        self._select_voice("matthias")  
         try:
             self.engine.setProperty("rate", 190)    
             self.engine.setProperty("volume", 0.9)  

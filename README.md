@@ -37,4 +37,20 @@ um db zu installieren
 cd  .\.geo_data
 python geo_import.py 
  
-    
+src ornder erstellen
+New-Item -ItemType Directory -Force -Path .\geo_data\src, .\geo_data\src\postal | Out-Null
+
+GeoNames-Dateien herunterlade
+# Basis-URL
+$base = "https://download.geonames.org/export/dump/"
+
+# Pflicht
+Invoke-WebRequest -Uri ($base + "countryInfo.txt")       -OutFile .\geo_data\src\countryInfo.txt
+Invoke-WebRequest -Uri ($base + "admin1CodesASCII.txt")  -OutFile .\geo_data\src\admin1CodesASCII.txt
+Invoke-WebRequest -Uri ($base + "admin2Codes.txt")       -OutFile .\geo_data\src\admin2Codes.txt
+Invoke-WebRequest -Uri ($base + "allCountries.zip")      -OutFile .\geo_data\src\allCountries.zip
+Invoke-WebRequest -Uri ($base + "alternateNamesV2.zip")  -OutFile .\geo_data\src\alternateNamesV2.zip
+
+# OPTIONAL: Postleitzahlen
+Invoke-WebRequest -Uri "https://download.geonames.org/export/zip/allCountries.zip" `
+  -OutFile .\geo_data\src\postal\allCountries.zip
