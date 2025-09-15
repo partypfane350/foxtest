@@ -34,7 +34,7 @@
  http://127.0.0.1:8010/chat
 
 um db zu installieren
-cd  .\.geo_data
+cd  .\geo_data
 python geo_import.py 
  
 src ornder erstellen
