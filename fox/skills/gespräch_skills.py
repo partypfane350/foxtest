@@ -64,9 +64,8 @@ def _reply_smalltalk(t: str) -> Optional[str]:
     if _RE_HOW_ARE_YOU.search(t):
         return random.choice([
             "Mir geht’s gut, danke! Und dir?",
-            "Alles bestens – bereit zu helfen. Wie kann ich dich unterstützen?",
-            "Läuft bei mir 😊 Was steht bei dir an?"
         ])
+    
     if _RE_JOKE.search(t):
         jokes = [
             "Warum können Seeräuber schlecht programmieren? – Weil sie C nicht kennen… Arr!",
@@ -74,8 +73,10 @@ def _reply_smalltalk(t: str) -> Optional[str]:
             "Treffen sich zwei Arrays. Sagt das eine: 'Sort mal deine Gedanken!'"
         ]
         return random.choice(jokes)
+    
     if _RE_WHAT_DO.search(t):
         return "Ich helfe dir mit Zeit, Terminen, Mathe, Geo/Orten, Wetter und kurzem Wissen. Sag einfach, was du brauchst."
+    
     if _RE_FAVORITE.search(t):
         return "Ich esse nicht – aber ich bin Fan von gut strukturiertem Code und klaren Antworten. 😄"
     return None
