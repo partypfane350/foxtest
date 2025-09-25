@@ -18,7 +18,7 @@
 
     - **Windows:**
       ```sh
-      .\venv\Scripts\activate
+      .\.venv\Scripts\activate
       ```
     - **macOS/Linux:**
       ```sh
@@ -58,6 +58,8 @@
         Invoke-WebRequest -Uri "https://download.geonames.org/export/dump/allCountries.zip"      -OutFile .\geo_data\src\allCountries.zip
         Invoke-WebRequest -Uri "https://download.geonames.org/export/dump/alternateNamesV2.zip"  -OutFile .\geo_data\src\alternateNamesV2.zip
         Invoke-WebRequest -Uri "https://download.geonames.org/export/dump/timeZones.txt"         -OutFile .\geo_data\src\timeZones.txt
+        Invoke-WebRequest -Uri "https://download.geonames.org/export/zip/allCountries.zip" -OutFile .\geo_data\src\postal.zip
+
         ```
 
 10. **Sicherstellen, dass geo_data\osm existiert:**
@@ -224,7 +226,7 @@ Start-BitsTransfer -Source "https://zenodo.org/record/2345678/files/architecture
 if (-not (Test-Path ".\architecture_data\figshare")) {New-Item -Path ".\architecture_data\figshare" -ItemType Directory -Force | Out-Null}
 Start-BitsTransfer -Source "https://ndownloader.figshare.com/files/34567890" -Destination ".\architecture_data\figshare\building_data.zip"
 
-17. **Pyhsik**
+17. **Physik**
 
 # arXiv – Physik-Preprints
 if (-not (Test-Path ".\physics_data\arxiv")) {New-Item -Path ".\physics_data\arxiv" -ItemType Directory -Force | Out-Null}

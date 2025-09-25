@@ -1,7 +1,6 @@
 from __future__ import annotations
 import pyttsx3
 import threading
-import re
 
 class Speech:
     def __init__(self, enabled: bool = True):
@@ -9,53 +8,48 @@ class Speech:
         self._lock = threading.Lock()
         self.engine = pyttsx3.init()
 
-        # ==== Standard-Einstellungen ====
-        self._select_voice("matthias")  
+        # Stimme setzen (männliche bevorzugt)
+        self._force_male_voice()
+
+        # Grundeinstellungen
         try:
-            self.engine.setProperty("rate", 190)    
-            self.engine.setProperty("volume", 0.9)  
+            self.engine.setProperty("rate", 190)    # Geschwindigkeit
+            self.engine.setProperty("volume", 0.6)  # Lautstärke
         except Exception:
             pass
 
-    def _select_voice(self, hint: str):
-        """Stimme nach Teilstring auswählen (z. B. 'stefan')."""
-        hint = (hint or "").lower()
+    def _force_male_voice(self):
+        """Versucht eine männliche Stimme auszuwählen (z. B. Stefan, David)."""
         try:
             voices = self.engine.getProperty("voices")
-            # Desktop-Stimmen bevorzugen
-            preferred = [v for v in voices if "desktop" in (getattr(v,"name","")+getattr(v,"id","")).lower()]
-            pool = preferred + [v for v in voices if v not in preferred]
-            for v in pool:
+            for v in voices:
                 text = f"{getattr(v,'id','')} {getattr(v,'name','')}".lower()
-                if hint in text:
+                if any(hint in text for hint in ["male", "stefan", "david"]):
                     self.engine.setProperty("voice", v.id)
+                    print(f"[Speech] Stimme gesetzt: {v.name}")
                     return
-        except Exception:
-            pass
+            print("[Speech] Keine männliche Stimme gefunden, benutze Standard.")
+        except Exception as e:
+            print(f"[Speech] Fehler bei der Stimmauswahl: {e}")
 
     def say(self, text: str):
+        """Spricht den gegebenen Text."""
         if not self.enabled or not text:
             return
         with self._lock:
             try:
-                self.engine.setProperty("rate", 190)
-                self.engine.setProperty("volume", 0.9)
                 self.engine.stop()
-            except Exception:
-                pass
-        try:
-            # Spezielle Behandlung für Uhrzeiten
-            if "Es ist" in text and "Uhr" in text:
-                # Text in einzelne Wörter zerlegen und nur die relevanten Teile behalten
-                words = text.split()
-                # Nur "Es ist X Uhr Y" behalten
-                text = " ".join(words[:5]) if len(words) >= 5 else text
-                
-            self.engine.say(text)
-            self.engine.runAndWait()
-        except Exception as e:
-            print(f"[Speech] Warnung: {e}")
+                self.engine.say(text)
+                self.engine.runAndWait()
+            except Exception as e:
+                print(f"[Speech] Warnung: {e}")
 
     def set_enabled(self, on: bool):
+        """Sprache an- oder ausschalten."""
         self.enabled = bool(on)
-        
+
+
+# Beispiel:
+if __name__ == "__main__":
+    speech = Speech()
+    speech.say("Hallo, ich bin eine männliche Stimme – wenn verfügbar.")
